@@ -8,295 +8,225 @@ from threading import Thread
 
 app = Flask(__name__)
 
-# 🔐 CONFIG
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-ID_INSTANCE = os.getenv("ID_INSTANCE")
-API_TOKEN = os.getenv("API_TOKEN")
-GREEN_API_URL = f"https://api.green-api.com/waInstance{ID_INSTANCE}/sendMessage/{API_TOKEN}"
+# ─────────────────────────────────────────
+# 🔐 CONFIG (variables d'environnement)
+# ─────────────────────────────────────────
+GROQ_API_KEY      = os.getenv("GROQ_API_KEY")
+ID_INSTANCE       = os.getenv("ID_INSTANCE")
+API_TOKEN         = os.getenv("API_TOKEN")
+INTERNAL_GROUP_ID = os.getenv("INTERNAL_GROUP_ID", "REMPLACE_PAR_TON_GROUP_ID@g.us")
 
-# ⚡ Cache pour éviter les doublons (messages traités)
-processed_messages = set()
+GREEN_API_BASE = f"https://api.green-api.com/waInstance{ID_INSTANCE}"
+
+# ─────────────────────────────────────────
+# 🗂️ ÉTAT EN MÉMOIRE
+# ─────────────────────────────────────────
+# Etats possibles par chat_id :
+#   "menu"    → a reçu le menu 1/2, attend un choix
+#   "human"   → a choisi 1, transféré à un humain (bot silencieux)
+#   "ai"      → a choisi 2, mode IA actif
+
+user_state: dict[str, str] = {}
+processed_messages: set[str] = set()
 
 
-# 🧹 Nettoyage périodique du cache
+# ─────────────────────────────────────────
+# 🧹 Nettoyage mémoire périodique
+# ─────────────────────────────────────────
 def clean_cache():
     while True:
-        time.sleep(60)
-        if len(processed_messages) > 1000:
+        time.sleep(300)
+        if len(processed_messages) > 2000:
             processed_messages.clear()
-
 
 Thread(target=clean_cache, daemon=True).start()
 
 
-# 🧠 LOG UTILITAIRE
-def log(title, data, force=False):
+# ─────────────────────────────────────────
+# 🧠 LOG
+# ─────────────────────────────────────────
+def log(title: str, data: dict, force: bool = False):
     if force or os.getenv("DEBUG", "false").lower() == "true":
         print(f"\n{'=' * 60}\n🔥 {title}\n{'=' * 60}")
-        print(json.dumps(data, indent=2, ensure_ascii=False)[:500])
+        print(json.dumps(data, indent=2, ensure_ascii=False)[:600])
         print("=" * 60 + "\n")
 
 
-# ────────────────────────────────────────────────────────────
-# 🤖  ÉTAPE 1 — FILTRE DE PERTINENCE (modèle léger, rapide)
-# ────────────────────────────────────────────────────────────
-def is_relevant(message: str) -> bool:
-    """
-    Appelle Groq avec un mini-prompt de classification.
-    Retourne True si le message concerne Chana Corporate,
-    False sinon. Timeout court (5 s) car c'est juste un filtre.
-    """
-    try:
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {GROQ_API_KEY}"
-        }
-        payload = {
-            "model": "llama-3.3-70b-versatile",
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "Tu es un classificateur binaire. "
-                        "Réponds UNIQUEMENT par le mot OUI ou le mot NON, sans ponctuation, sans espace.\n\n"
-                        "Réponds OUI si le message parle de : Chana Corporate, mission commerciale, "
-                        "voyage en Chine, Zhejiang, Yiwu, fournisseurs, importation, exportation, "
-                        "sourcing, visa Chine, inscription, paiement, usines, produits chinois, "
-                        "logistique, commandes, livraison, BTP, automobile, textile, électroménager, "
-                        "agriculture, mobilier, équipements médicaux, énergies renouvelables, "
-                        "tarifs, acompte, African Wind, partenaires chinois.\n\n"
-                        "Réponds NON pour tout le reste (météo, politique, cuisine, sport, blagues, "
-                        "santé générale, religion, salutations sans contexte business, etc.)."
-                    )
-                },
-                {"role": "user", "content": message}
-            ],
-            "temperature": 0.0,
-            "max_tokens": 5
-        }
-        res = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            json=payload,
-            headers=headers,
-            timeout=5
-        )
-        if res.status_code != 200:
-            # En cas d'erreur du filtre, on laisse passer (fail-open)
-            return True
-        answer = res.json()["choices"][0]["message"]["content"].strip().upper()
-        return answer.startswith("OUI")
-    except Exception as e:
-        print(f"⚠️  FILTER ERROR (fail-open): {e}")
-        return True   # fail-open : vaut mieux répondre que de bloquer
-
-
-# ────────────────────────────────────────────────────────────
-# 🤖  ÉTAPE 2 — RÉPONSE COMPLÈTE (aucune limite de tokens)
-# ────────────────────────────────────────────────────────────
-def ask_groq(message: str) -> str:
-    try:
-        start = time.time()
-
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {GROQ_API_KEY}"
-        }
-
-        # PROMPT SYSTEM — retours à la ligne réels (pas \\n)
-        system_prompt = """Tu es CHANA ASSISTANT, l'assistant virtuel officiel de Chana Corporate.
-
-Tu représentes l'entreprise Chana Corporate 24h/24 et 7j/7 sur WhatsApp.
-
-MISSION :
-- Accueillir les prospects.
-- Répondre à TOUTES les questions posées dans un même message, sans en omettre aucune.
-- Présenter les services de l'entreprise.
-- Fournir toutes les informations relatives à la Mission Commerciale Chine 2026.
-- Répondre aux questions sur les inscriptions.
-- Rassurer les prospects.
-- Lever les objections commerciales.
-- Qualifier les prospects.
-- Collecter les besoins du client.
-- Identifier les personnes réellement intéressées.
-- Faire gagner du temps aux équipes humaines.
-
-Tu n'es PAS un assistant généraliste.
-Tu es exclusivement dédié aux activités de Chana Corporate.
-
-RÈGLES DE COMMUNICATION :
-1. Réponds uniquement en français.
-2. Réponds à TOUTES les questions posées dans le message, même s'il y en a beaucoup. Ne te coupe jamais.
-3. Ton professionnel, chaleureux et rassurant.
-4. Toujours répondre comme un représentant officiel de Chana Corporate.
-5. Ne jamais inventer une information.
-6. Ne jamais donner une réponse approximative.
-7. Si l'information n'est pas connue, répondre : Je vais transmettre votre demande à un conseiller de Chana Corporate.
-8. Ne jamais discuter de politique.
-9. Ne jamais discuter de religion.
-10. Ne jamais donner d'avis personnel.
-11. Ne jamais répondre à des sujets sans lien avec Chana Corporate.
-
-TRANSFERT HUMAIN :
-Si le client demande un responsable, un conseiller, un rappel, un rendez-vous, souhaite parler à un humain, déposer une réclamation, suivre un dossier personnel, négocier un contrat ou proposer un partenariat, réponds uniquement : TRANSFERT
-
-PRÉSENTATION DE CHANA CORPORATE :
-Chana Corporate est une entreprise ivoirienne spécialisée dans l'accompagnement commercial international, la mise en relation d'affaires, le sourcing international, la recherche de fournisseurs fiables, l'organisation de missions commerciales, l'accompagnement logistique et le développement de partenariats stratégiques.
-Notre objectif est de permettre aux entreprises, commerçants et particuliers de sécuriser leurs approvisionnements internationaux et d'améliorer leur rentabilité.
-
-MISSION COMMERCIALE CHINE 2026 :
-Nom : Mission Commerciale Côte d'Ivoire - Chine 2026.
-Dates : arrivée le 22 juillet 2026 et départ le 31 juillet 2026.
-Durée : 10 jours.
-Destination : Province de Zhejiang en République Populaire de Chine.
-Organisation : Chana Corporate et African Wind.
-Partenaire local : consortium regroupant plus de 1000 entreprises chinoises.
-
-OBJECTIFS DE LA MISSION :
-- Acheter directement auprès des usines.
-- Réduire les intermédiaires.
-- Augmenter les marges bénéficiaires.
-- Sécuriser les approvisionnements.
-- Trouver des fournisseurs fiables.
-- Négocier des tarifs préférentiels.
-- Développer un réseau d'affaires international.
-- Établir des partenariats durables.
-
-POURQUOI LE ZHEJIANG ?
-- Plus de 1000 entreprises partenaires.
-- Région d'origine d'Alibaba.
-- Région d'origine de Geely.
-- Présence du marché international de Yiwu.
-- Infrastructures portuaires de premier plan.
-- Prix souvent plus compétitifs que Guangzhou.
-- Forte concentration de PME industrielles.
-
-PROFIL DES PARTICIPANTS :
-Entreprises, PME, grandes sociétés, commerçants, coopératives, importateurs, distributeurs, entrepreneurs et particuliers souhaitant développer une activité.
-
-SECTEURS CONCERNÉS :
-BTP, automobile, agriculture, électroménager, textile, fournitures scolaires, fournitures de bureau, mobilier, équipements médicaux, énergies renouvelables et commerce général.
-
-CONTENU DU FORFAIT :
-- Visa business.
-- Billet d'avion aller-retour.
-- Hébergement hôtel 3 ou 4 étoiles.
-- Petit-déjeuner, déjeuner et dîner.
-- Rencontres B2B.
-- Networking professionnel.
-- Visites d'usines.
-- Visite du marché international de Yiwu.
-- Transport local.
-- Interprètes chinois-français.
-- Accompagnement commercial.
-- Accompagnement logistique.
-- Suivi des commandes.
-- Contrôle qualité.
-- Assistance jusqu'à la livraison.
-
-PROGRAMME DU VOYAGE :
-Jours 1 à 2 : accueil, installation, briefing, orientation et découverte culturelle.
-Jour 3 : rencontres B2B et réseautage.
-Jours 4 à 6 : visites d'usines et visite du marché de Yiwu.
-Jours 7 à 8 : négociations, commandes et finalisation des transactions.
-Jours 9 à 10 : débriefing, visite portuaire et retour.
-
-TARIFICATION :
-Coût total : 2 500 000 FCFA par participant.
-Acompte : 1 000 000 FCFA à l'inscription.
-Solde : 1 500 000 FCFA avant le 1er juillet 2026.
-Paiements acceptés : Mobile Money, espèces et chèque.
-
-GARANTIES ET SÉCURITÉ :
-Les fournisseurs sont identifiés avant le voyage.
-Chaque participant bénéficie d'un sourcing personnalisé, d'une mise en relation ciblée, d'un accompagnement commercial, d'un suivi logistique et d'un suivi des commandes.
-Les commandes font l'objet d'un suivi après le retour en Côte d'Ivoire.
-
-QUALIFICATION DES PROSPECTS :
-Lorsque le prospect montre de l'intérêt, cherche à connaître son activité, les produits recherchés, son budget, son expérience d'importation et les volumes souhaités.
-Question recommandée : Pouvez-vous me préciser le type de produit que vous recherchez afin que nous puissions évaluer les opportunités adaptées à votre besoin ?
-
-COORDONNÉES OFFICIELLES :
-WhatsApp : +225 05 00 02 60 72
-Téléphone : +225 27 22 23 66 83
-Email : chanacorporate@gmail.com
-Adresse 1 : Cocody Riviera 3, Rue Kloé, près de la Clinique Saint Viateur.
-Adresse 2 : Immeuble XL, Rue Dr Crozet, Boulevard de la République.
-
-SALUTATIONS :
-Si le client dit Bonjour, réponds : Bonjour et bienvenue chez Chana Corporate. Je suis à votre disposition pour vous renseigner sur notre mission commerciale en Chine ou nos services d'accompagnement international.
-Si le client dit Bonsoir, réponds : Bonsoir et bienvenue chez Chana Corporate. Comment puis-je vous aider aujourd'hui ?
-
-OBJECTIF FINAL :
-Informer, rassurer, qualifier les prospects, identifier les prospects sérieux, favoriser l'inscription à la mission commerciale, transférer les demandes sensibles à un humain."""
-
-        payload = {
-            "model": "llama-3.3-70b-versatile",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": message}
-            ],
-            "temperature": 0.3,
-            "max_tokens": 1024,   # ✅ Augmenté pour ne jamais couper les réponses
-            "top_p": 1
-        }
-
-        res = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            json=payload,
-            headers=headers,
-            timeout=15   # ✅ Légèrement augmenté car réponses plus longues possibles
-        )
-
-        duration = time.time() - start
-
-        if res.status_code != 200:
-            log("GROQ ERROR", {"status": res.status_code, "body": res.text[:300]}, force=True)
-            return "Désolé, une erreur est survenue. Veuillez réessayer."
-
-        data = res.json()
-        reply = data["choices"][0]["message"]["content"].strip()
-
-        log("GROQ OK", {"duration": f"{duration:.2f}s", "reply": reply[:200]})
-
-        return reply
-
-    except requests.Timeout:
-        print("❌ GROQ TIMEOUT")
-        return "Je réfléchis, merci de patienter quelques secondes..."
-    except Exception as e:
-        print(f"❌ GROQ ERROR: {e}")
-        return "Désolé, le service est momentanément indisponible."
-
-
+# ─────────────────────────────────────────
 # 📤 ENVOI WHATSAPP
-def send_whatsapp(chat_id, message):
+# ─────────────────────────────────────────
+def send_whatsapp(chat_id: str, message: str) -> bool:
     try:
+        url     = f"{GREEN_API_BASE}/sendMessage/{API_TOKEN}"
         payload = {"chatId": chat_id, "message": message}
-        res = requests.post(
-            GREEN_API_URL,
-            json=payload,
-            timeout=5
-        )
-        log("GREEN API", {
-            "status": res.status_code,
-            "chat_id": chat_id,
-            "message": message[:50]
-        })
+        res     = requests.post(url, json=payload, timeout=8)
+        log("SEND", {"to": chat_id, "status": res.status_code, "msg": message[:80]})
         return res.status_code == 200
     except Exception as e:
-        print(f"❌ SEND ERROR: {e}")
+        print(f"❌ SEND ERROR ({chat_id}): {e}")
         return False
 
 
-# 🛡️ Anti-doublon
-def is_duplicate(msg_id):
+# ─────────────────────────────────────────
+# 🚨 ALERTE GROUPE INTERNE
+# ─────────────────────────────────────────
+def alert_internal_team(chat_id: str, message: str):
+    alert = (
+        f"🚨 *DEMANDE OPÉRATEUR*\n\n"
+        f"👤 Numéro client : {chat_id}\n"
+        f"💬 Message : \"{message[:300]}\"\n\n"
+        f"✅ Action requise : prise en charge humaine"
+    )
+    ok = send_whatsapp(INTERNAL_GROUP_ID, alert)
+    print(f"{'✅' if ok else '❌'} Alerte interne → {chat_id}")
+
+
+# ─────────────────────────────────────────
+# 🤖 RÉPONSE IA (Groq)
+# ─────────────────────────────────────────
+SYSTEM_PROMPT = """Tu es CHANA ASSISTANT, l'assistant virtuel officiel de Chana Corporate.
+Tu représentes l'entreprise 24h/24 et 7j/7 sur WhatsApp.
+
+RÈGLES ABSOLUES :
+1. Réponds UNIQUEMENT en français.
+2. Réponds à TOUTES les questions posées dans un même message sans en omettre aucune.
+3. Ton professionnel, chaleureux et rassurant.
+4. Ne jamais inventer une information. Si inconnue : "Je transmettrai votre demande à un conseiller."
+5. Ne jamais discuter de politique, religion ou sujets hors-sujet.
+6. NE PAS saluer à nouveau — le client a déjà été accueilli.
+
+PRÉSENTATION CHANA CORPORATE :
+Entreprise ivoirienne spécialisée dans l'accompagnement commercial international, mise en relation d'affaires, sourcing international, recherche de fournisseurs fiables, organisation de missions commerciales, accompagnement logistique et développement de partenariats stratégiques.
+
+MISSION COMMERCIALE CHINE 2026 :
+- Nom : Mission Commerciale Côte d'Ivoire - Chine 2026
+- Dates : 22 au 31 juillet 2026 (10 jours)
+- Destination : Province de Zhejiang, Chine
+- Organisateurs : Chana Corporate & African Wind
+- Partenaire local : consortium de 1 000+ entreprises chinoises
+
+OBJECTIFS :
+Achat direct en usine · Réduction des intermédiaires · Marges améliorées · Fournisseurs fiables · Tarifs préférentiels · Réseau d'affaires international · Partenariats durables
+
+POURQUOI LE ZHEJIANG ?
+1 000+ entreprises partenaires · Berceau d'Alibaba et Geely · Marché international de Yiwu · Infrastructures portuaires de premier plan · Prix plus compétitifs que Guangzhou · Forte densité de PME industrielles
+
+PROFIL PARTICIPANTS :
+Entreprises, PME, commerçants, coopératives, importateurs, distributeurs, entrepreneurs, particuliers
+
+SECTEURS :
+BTP · Automobile · Agriculture · Électroménager · Textile · Fournitures scolaires/bureau · Mobilier · Équipements médicaux · Énergies renouvelables · Commerce général
+
+CONTENU DU FORFAIT (tout inclus) :
+Visa business · Billet A/R · Hôtel 3-4 étoiles · 3 repas/jour · Rencontres B2B · Visites d'usines · Marché de Yiwu · Transport local · Interprètes français-chinois · Accompagnement commercial & logistique · Suivi commandes · Contrôle qualité · Assistance jusqu'à livraison
+
+PROGRAMME :
+J1-J2 : Accueil, installation, briefing, découverte culturelle
+J3 : Rencontres B2B et réseautage
+J4-J6 : Visites d'usines + marché de Yiwu
+J7-J8 : Négociations, commandes, finalisation
+J9-J10 : Débriefing, visite portuaire, retour
+
+TARIFICATION :
+Total : 2 500 000 FCFA/participant
+Acompte (40%) : 1 000 000 FCFA à l'inscription
+Solde (60%) : 1 500 000 FCFA avant le 1er juillet 2026
+Paiements : Mobile Money, espèces, chèque
+
+GARANTIES :
+Fournisseurs identifiés avant le départ · Sourcing personnalisé · Mise en relation ciblée · Suivi logistique & commandes après retour
+
+QUALIFICATION PROSPECT :
+Si intérêt détecté, poser : "Quel type de produit recherchez-vous ? Cela nous permettra d'identifier les opportunités adaptées à votre besoin."
+
+COORDONNÉES :
+WhatsApp : +225 05 00 02 60 72
+Téléphone : +225 27 22 23 66 83
+Email : chanacorporate@gmail.com
+Adresse 1 : Cocody Riviera 3, Rue Kloé, près de la Clinique Saint Viateur
+Adresse 2 : Immeuble XL, Rue Dr Crozet, Boulevard de la République"""
+
+
+def ask_groq(message: str) -> str:
+    try:
+        start = time.time()
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {GROQ_API_KEY}"
+        }
+        payload = {
+            "model": "llama-3.3-70b-versatile",
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": message}
+            ],
+            "temperature": 0.3,
+            "max_tokens": 1024,
+            "top_p": 1
+        }
+        res = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            json=payload, headers=headers, timeout=15
+        )
+        duration = time.time() - start
+        if res.status_code != 200:
+            log("GROQ ERROR", {"status": res.status_code, "body": res.text[:300]}, force=True)
+            return "Désolé, une erreur est survenue. Veuillez réessayer dans quelques instants."
+        reply = res.json()["choices"][0]["message"]["content"].strip()
+        log("GROQ OK", {"duration": f"{duration:.2f}s", "reply": reply[:200]})
+        return reply
+    except requests.Timeout:
+        return "Je réfléchis encore... merci de patienter quelques secondes puis renvoyez votre question. 🙏"
+    except Exception as e:
+        print(f"❌ GROQ ERROR: {e}")
+        return "Le service est momentanément indisponible. Veuillez réessayer."
+
+
+# ─────────────────────────────────────────
+# 📩 MESSAGES PRÉDÉFINIS
+# ─────────────────────────────────────────
+WELCOME_MENU = (
+    "Bonjour et bienvenue chez Chana Corporate 👋\n\n"
+    "Avant de continuer, merci de choisir une option en répondant par un chiffre :\n\n"
+    "1️⃣ Vous avez besoin d'un conseiller humain\n"
+    "2️⃣ Vous souhaitez découvrir nos services et notre mission commerciale en Chine 🇨🇳\n\n"
+    "👉 Répondez simplement par *1* ou *2*."
+)
+
+INVALID_CHOICE = (
+    "Je n'ai pas compris votre choix. 😊\n\n"
+    "Merci de répondre uniquement par :\n"
+    "*1* → Parler à un conseiller humain\n"
+    "*2* → Découvrir nos services"
+)
+
+HUMAN_REPLY = (
+    "Merci ! Un conseiller Chana Corporate va vous contacter très rapidement. 🙏\n\n"
+    "En attendant, n'hésitez pas à nous joindre directement :\n"
+    "📞 +225 27 22 23 66 83\n"
+    "📧 chanacorporate@gmail.com"
+)
+
+AI_INTRO = (
+    "Avec plaisir ! 😊 Je suis CHANA ASSISTANT, votre guide pour tout savoir sur "
+    "notre mission commerciale en Chine et nos services.\n\n"
+    "Quelle est votre question ?"
+)
+
+
+# ─────────────────────────────────────────
+# 🛡️ ANTI-DOUBLON
+# ─────────────────────────────────────────
+def is_duplicate(msg_id: str) -> bool:
     if msg_id in processed_messages:
         return True
     processed_messages.add(msg_id)
     return False
 
 
-# 📩 WEBHOOK GREEN API
+# ─────────────────────────────────────────
+# 📩 WEBHOOK PRINCIPAL
+# ─────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
     start_time = time.time()
@@ -306,61 +236,115 @@ def webhook():
         if not data:
             return jsonify({"error": "Invalid JSON"}), 400
 
+        # Uniquement les messages entrants
         if data.get("typeWebhook") != "incomingMessageReceived":
             return jsonify({"ignored": True, "reason": "not_a_message"})
 
         sender   = data.get("senderData", {})
         msg_data = data.get("messageData", {})
 
-        chat_id = sender.get("chatId", "")
-        message = msg_data.get("textMessageData", {}).get("textMessage", "")
-        msg_id  = data.get("idMessage", "")
+        chat_id  = sender.get("chatId", "")
+        message  = msg_data.get("textMessageData", {}).get("textMessage", "").strip()
+        msg_id   = data.get("idMessage", "")
+
+        # Ignorer les groupes externes
+        if chat_id.endswith("@g.us"):
+            return jsonify({"ignored": True, "reason": "group_message"})
 
         if not chat_id or not message:
-            return jsonify({
-                "error": "Missing data",
-                "chat_id": chat_id,
-                "has_message": bool(message)
-            }), 200
+            return jsonify({"error": "Missing data"}), 200
 
-        # 🛡️ Anti-doublon
+        # Anti-doublon
         if msg_id and is_duplicate(msg_id):
             print(f"⛔ Doublon ignoré: {msg_id}")
             return jsonify({"ignored": True, "reason": "duplicate"})
 
-        log("📩 MESSAGE", {
-            "chat_id": chat_id,
-            "message": message[:100],
-            "msg_id": msg_id
-        })
+        log("📩 MESSAGE", {"chat_id": chat_id, "message": message[:100], "msg_id": msg_id})
 
-        # ✅ ÉTAPE 1 — Vérification de la pertinence
-        if not is_relevant(message):
-            print(f"🔕 Message hors-sujet ignoré: {message[:60]}")
+        state = user_state.get(chat_id)
+
+        # ═══════════════════════════════════════
+        # ÉTAPE 1 — Nouveau client : envoi du menu
+        # ═══════════════════════════════════════
+        if state is None:
+            user_state[chat_id] = "menu"
+            send_whatsapp(chat_id, WELCOME_MENU)
             return jsonify({
-                "ignored": True,
-                "reason": "off_topic",
-                "message": message[:60]
+                "success": True,
+                "action": "welcome_menu_sent",
+                "chat_id": chat_id,
+                "duration": f"{time.time() - start_time:.2f}s"
             })
 
-        # ✅ ÉTAPE 2 — Génération de la réponse
-        reply = ask_groq(message)
+        # ═══════════════════════════════════════
+        # ÉTAPE 2 — Client attend choix 1 ou 2
+        # ═══════════════════════════════════════
+        if state == "menu":
 
-        # 🔁 Remplacement TRANSFERT
-        if reply.strip().upper() == "TRANSFERT":
-            reply = "Je vous mets en relation avec un conseiller qui vous contactera très prochainement. 🙏"
+            # Choix 1 : opérateur humain
+            if message in ("1", "1️⃣"):
+                user_state[chat_id] = "human"
+                send_whatsapp(chat_id, HUMAN_REPLY)
+                Thread(
+                    target=alert_internal_team,
+                    args=(chat_id, message),
+                    daemon=True
+                ).start()
+                return jsonify({
+                    "success": True,
+                    "action": "human_transfer",
+                    "chat_id": chat_id,
+                    "duration": f"{time.time() - start_time:.2f}s"
+                })
 
-        # 📤 Envoi WhatsApp
-        send_whatsapp(chat_id, reply)
+            # Choix 2 : mode IA
+            if message in ("2", "2️⃣"):
+                user_state[chat_id] = "ai"
+                send_whatsapp(chat_id, AI_INTRO)
+                return jsonify({
+                    "success": True,
+                    "action": "ai_mode_activated",
+                    "chat_id": chat_id,
+                    "duration": f"{time.time() - start_time:.2f}s"
+                })
 
-        duration = time.time() - start_time
+            # Choix invalide : on redemande poliment
+            send_whatsapp(chat_id, INVALID_CHOICE)
+            return jsonify({
+                "success": True,
+                "action": "invalid_choice_reprompted",
+                "chat_id": chat_id,
+                "duration": f"{time.time() - start_time:.2f}s"
+            })
 
-        return jsonify({
-            "success": True,
-            "chat_id": chat_id,
-            "reply": reply,
-            "duration": f"{duration:.2f}s"
-        })
+        # ═══════════════════════════════════════
+        # ÉTAPE 3 — Client transféré à un humain
+        # Bot silencieux (ne pas interférer)
+        # ═══════════════════════════════════════
+        if state == "human":
+            print(f"🔕 Bot silencieux pour {chat_id} (état: human)")
+            return jsonify({
+                "ignored": True,
+                "reason": "human_mode_active",
+                "chat_id": chat_id
+            })
+
+        # ═══════════════════════════════════════
+        # ÉTAPE 4 — Mode IA actif
+        # ═══════════════════════════════════════
+        if state == "ai":
+            reply = ask_groq(message)
+            send_whatsapp(chat_id, reply)
+            return jsonify({
+                "success": True,
+                "action": "ai_reply",
+                "chat_id": chat_id,
+                "reply": reply,
+                "duration": f"{time.time() - start_time:.2f}s"
+            })
+
+        # Cas imprévu
+        return jsonify({"error": "Unknown state", "state": state}), 500
 
     except Exception as e:
         print(f"\n❌ CRITICAL ERROR: {e}")
@@ -371,31 +355,35 @@ def webhook():
         }), 500
 
 
-# 🏥 Health check
+# ─────────────────────────────────────────
+# 🏥 HEALTH CHECK
+# ─────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
+    states_count = {}
+    for s in user_state.values():
+        states_count[s] = states_count.get(s, 0) + 1
     return jsonify({
-        "status": "ok",
-        "service": "WhatsApp AI Bot — Chana Corporate",
-        "model": "llama-3.3-70b-versatile"
+        "status":             "ok",
+        "service":            "Chana Corporate WhatsApp Bot v3",
+        "model":              "llama-3.3-70b-versatile",
+        "total_users":        len(user_state),
+        "states_breakdown":   states_count,
+        "processed_messages": len(processed_messages)
     })
 
 
-# 🚀 RUN SERVER
+# ─────────────────────────────────────────
+# 🚀 DÉMARRAGE
+# ─────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-
     print(f"""
-    ╔══════════════════════════════════════╗
-    ║     🤖 CHANA CORPORATE BOT READY   ║
-    ║     Port: {port}                      ║
-    ║     Model: llama-3.3-70b-versatile ║
-    ╚══════════════════════════════════════╝
+    ╔══════════════════════════════════════════╗
+    ║   🤖  CHANA CORPORATE BOT  v3.0  READY  ║
+    ║   Port   : {port}                          ║
+    ║   Model  : llama-3.3-70b-versatile       ║
+    ║   Groupe : {INTERNAL_GROUP_ID[:35]}  ║
+    ╚══════════════════════════════════════════╝
     """)
-
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False,
-        threaded=True
-    )
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
