@@ -1,11 +1,26 @@
+"""
+╔══════════════════════════════════════════════════════════════╗
+║        CHANA CORPORATE WHATSAPP BOT  v8.0                   ║
+║        Render-optimized — stable, non-bloquant              ║
+╠══════════════════════════════════════════════════════════════╣
+║  Webhook répond en < 200ms (tout le traitement est async)   ║
+║  File de travail dédiée (queue) — pas de threads volants    ║
+║  TTL mémoire : user_state + history nettoyés toutes 2h      ║
+║  Tous les requests.post : timeout=(3, 10)                   ║
+║  /ping keep-alive pour Render                               ║
+║  Crash gunicorn worker → traceback complet dans les logs    ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+
 from flask import Flask, request, jsonify
 import requests
 import os
+import sys
 import traceback
 import json
 import time
 import threading
-import warnings
+import queue
 from datetime import datetime
 
 app = Flask(__name__)
@@ -13,13 +28,18 @@ app = Flask(__name__)
 # ═══════════════════════════════════════════════════════════════
 # 🔐 CONFIG
 # ═══════════════════════════════════════════════════════════════
-GROQ_API_KEY     = os.getenv("GROQ_API_KEY")
-ID_INSTANCE      = os.getenv("ID_INSTANCE")
-API_TOKEN        = os.getenv("API_TOKEN")
+GROQ_API_KEY     = os.getenv("GROQ_API_KEY",     "")
+ID_INSTANCE      = os.getenv("ID_INSTANCE",      "")
+API_TOKEN        = os.getenv("API_TOKEN",         "")
 OPERATOR_CHAT_ID = os.getenv("OPERATOR_CHAT_ID", "")
-BOT_OWN_NUMBER   = os.getenv("BOT_OWN_NUMBER", "")
+BOT_OWN_NUMBER   = os.getenv("BOT_OWN_NUMBER",   "")
 
 GREEN_API_BASE = f"https://api.green-api.com/waInstance{ID_INSTANCE}"
+
+# TTL mémoire : conversations inactives depuis X secondes → supprimées
+MEMORY_TTL_SECONDS = 7_200   # 2 heures
+# Max messages en historique par client
+HISTORY_MAX_MESSAGES = 20
 
 # ─────────────────────────────────────────
 # 🔗 LIENS OFFICIELS
@@ -29,30 +49,25 @@ LINK_BROCHURE    = "https://drive.google.com/file/d/1YEEsJEDARjkb2QBk1dw3SVDtVNm
 LINK_FORM_PDF    = "https://drive.google.com/file/d/1QtZaRDUHgVsRIal05i7RuhvVVz1gnZEz/view?usp=sharing"
 
 # ═══════════════════════════════════════════════════════════════
-# 🗂️  ÉTATS EN MÉMOIRE
-#
-# step:
-#   "pending"  → message reçu, en attente de qualification IA
-#   "ai"       → prospect qualifié, conversation IA active
-#   "human"    → transféré à un humain, bot silencieux
-#
+# 🗂️  MÉMOIRE — avec horodatage pour TTL
 # ═══════════════════════════════════════════════════════════════
+# user_state[chat_id] = {
+#   "step":       "ai" | "human",
+#   "exchanges":  int,
+#   "escalated":  bool,
+#   "created_at": float (timestamp),
+#   "last_seen":  float (timestamp mis à jour à chaque message)
+# }
 user_state:           dict[str, dict] = {}
-processed_messages:   set[str]        = set()
 conversation_history: dict[str, list] = {}
+processed_messages:   set[str]        = set()
 
-
-# ─────────────────────────────────────────
-# 🧹 Nettoyage mémoire
-# ─────────────────────────────────────────
-def clean_cache():
-    while True:
-        time.sleep(300)
-        if len(processed_messages) > 2000:
-            processed_messages.clear()
-            print("🧹 Cache vidé.")
-
-threading.Thread(target=clean_cache, daemon=True).start()
+# ─────────────────────────────────────────────────────────────
+# 📬 FILE DE TRAVAIL ASYNC
+# Le webhook dépose un job ici et répond immédiatement.
+# Un worker dédié consomme la file en arrière-plan.
+# ─────────────────────────────────────────────────────────────
+work_queue: queue.Queue = queue.Queue(maxsize=200)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -60,173 +75,168 @@ threading.Thread(target=clean_cache, daemon=True).start()
 # ═══════════════════════════════════════════════════════════════
 def check_env():
     required = {
-        "GROQ_API_KEY":    GROQ_API_KEY,
-        "ID_INSTANCE":     ID_INSTANCE,
-        "API_TOKEN":       API_TOKEN,
+        "GROQ_API_KEY":     GROQ_API_KEY,
+        "ID_INSTANCE":      ID_INSTANCE,
+        "API_TOKEN":        API_TOKEN,
         "OPERATOR_CHAT_ID": OPERATOR_CHAT_ID,
     }
     missing = [k for k, v in required.items() if not v]
     if missing:
-        print("\n" + "⚠️  " * 15)
-        print(f"❌ VARIABLES MANQUANTES : {', '.join(missing)}")
-        print("   → Ajoutez-les dans Render > Environment")
-        print("⚠️  " * 15 + "\n")
+        print(f"\n❌ VARIABLES MANQUANTES : {', '.join(missing)}", flush=True)
+        print("   → Render > Environment → ajouter ces variables\n", flush=True)
     else:
-        print("✅ Toutes les variables d'environnement sont présentes.")
+        print("✅ Variables d'environnement : OK", flush=True)
 
     target_type = "GROUPE" if OPERATOR_CHAT_ID.endswith("@g.us") else "NUMÉRO"
-    print(f"📢 Alertes opérateur → {target_type} : {OPERATOR_CHAT_ID or '⚠️ NON CONFIGURÉ'}")
-    if BOT_OWN_NUMBER:
-        print(f"🤖 Numéro du bot : {BOT_OWN_NUMBER}")
+    print(f"📢 Alertes → {target_type} : {OPERATOR_CHAT_ID or '⚠️ NON CONFIGURÉ'}", flush=True)
 
 
 # ═══════════════════════════════════════════════════════════════
-# 📤 ENVOI WHATSAPP — logs complets
+# 🧹 NETTOYAGE MÉMOIRE avec TTL (lancé en background)
+# Tourne toutes les 30 min, expurge les entrées inactives > 2h
+# ═══════════════════════════════════════════════════════════════
+def memory_cleanup_loop():
+    while True:
+        try:
+            time.sleep(1_800)   # toutes les 30 minutes
+            now        = time.time()
+            cutoff     = now - MEMORY_TTL_SECONDS
+            expired    = [
+                cid for cid, s in user_state.items()
+                if s.get("last_seen", s.get("created_at", 0)) < cutoff
+            ]
+            for cid in expired:
+                user_state.pop(cid, None)
+                conversation_history.pop(cid, None)
+
+            # Purge processed_messages si trop grand
+            if len(processed_messages) > 3_000:
+                processed_messages.clear()
+
+            if expired:
+                print(
+                    f"🧹 Nettoyage mémoire : {len(expired)} session(s) expirée(s) supprimée(s) "
+                    f"| user_state={len(user_state)} | history={len(conversation_history)}",
+                    flush=True
+                )
+        except Exception as e:
+            print(f"⚠️  Erreur dans memory_cleanup_loop : {e}", flush=True)
+
+
+threading.Thread(target=memory_cleanup_loop, daemon=True, name="MemoryCleanup").start()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 📤 ENVOI WHATSAPP — timeout (3, 10) — logs complets
+#   connect_timeout=3s  /  read_timeout=10s
 # ═══════════════════════════════════════════════════════════════
 def send_whatsapp(chat_id: str, message: str) -> bool:
     if not chat_id:
-        print("❌ SEND BLOCKED : chat_id vide.")
+        print("❌ SEND BLOCKED : chat_id vide.", flush=True)
         return False
     if BOT_OWN_NUMBER and chat_id == BOT_OWN_NUMBER:
-        print(f"❌ SEND BLOCKED : envoi vers le propre numéro du bot ({chat_id}).")
+        print(f"❌ SEND BLOCKED : self-send ({chat_id}).", flush=True)
         return False
 
     url     = f"{GREEN_API_BASE}/sendMessage/{API_TOKEN}"
     payload = {"chatId": chat_id, "message": message}
 
-    print(f"\n{'─'*55}")
-    print(f"📤 ENVOI → {chat_id}")
-    print(f"   Message  : {message[:100]}")
-
+    print(f"📤 → {chat_id} | {message[:80]}", flush=True)
     try:
-        res = requests.post(url, json=payload, timeout=10)
-        print(f"   Status   : {res.status_code}")
-        print(f"   Response : {res.text[:200]}")
-        ok = res.status_code == 200
-        print(f"   {'✅ OK' if ok else '❌ ÉCHEC'}")
-        print(f"{'─'*55}\n")
+        res = requests.post(url, json=payload, timeout=(3, 10))
+        ok  = res.status_code == 200
+        print(
+            f"   {'✅' if ok else '❌'} status={res.status_code} | {res.text[:150]}",
+            flush=True
+        )
         return ok
-    except requests.Timeout:
-        print(f"   ❌ TIMEOUT\n{'─'*55}\n")
+    except requests.exceptions.ConnectTimeout:
+        print(f"   ❌ ConnectTimeout → {chat_id}", flush=True)
+        return False
+    except requests.exceptions.ReadTimeout:
+        print(f"   ❌ ReadTimeout → {chat_id}", flush=True)
         return False
     except Exception as e:
-        print(f"   ❌ EXCEPTION : {e}\n{'─'*55}\n")
+        print(f"   ❌ EXCEPTION → {chat_id} : {e}", flush=True)
         return False
 
 
 # ═══════════════════════════════════════════════════════════════
-# 🚨 ALERTES OPÉRATEUR
+# 🚨 ALERTES OPÉRATEUR — envoyées directement (dans le worker)
 # ═══════════════════════════════════════════════════════════════
-def _safe_alert(chat_id: str, message: str, label: str):
-    ok = send_whatsapp(OPERATOR_CHAT_ID, message)
-    print(f"{'✅' if ok else '❌'} Alerte [{label}] pour {chat_id}")
-
-
 def alert_operator_escalation(chat_id: str, last_message: str):
     ts = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    alert = (
+    send_whatsapp(OPERATOR_CHAT_ID, (
         f"🔔 *CLIENT PRÊT POUR PRISE EN CHARGE*\n\n"
         f"📞 Client : {chat_id}\n"
         f"💬 Dernier message : \"{last_message[:250]}\"\n"
         f"📊 Statut : *5 échanges IA complétés*\n"
         f"⏱️  Heure : {ts}\n\n"
         f"👉 Ce client attend qu'un conseiller le recontacte."
-    )
-    threading.Thread(target=_safe_alert, args=(chat_id, alert, "ESCALADE AUTO"), daemon=True).start()
+    ))
 
 
 def alert_operator_human_request(chat_id: str, last_message: str):
     ts = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    alert = (
+    send_whatsapp(OPERATOR_CHAT_ID, (
         f"🚨 *DEMANDE HUMAIN EXPLICITE*\n\n"
         f"📞 Client : {chat_id}\n"
         f"💬 Message : \"{last_message[:250]}\"\n"
         f"📌 TYPE : *URGENT — CLIENT DEMANDE UN CONSEILLER*\n"
         f"⏱️  Heure : {ts}"
-    )
-    threading.Thread(target=_safe_alert, args=(chat_id, alert, "HUMAIN URGENT"), daemon=True).start()
+    ))
 
 
 # ═══════════════════════════════════════════════════════════════
-# 🔍 ÉTAPE 1 — QUALIFICATION PROSPECT (appel Groq léger)
-#
-# Cette fonction est le FILTRE D'ENTRÉE.
-# Elle est appelée UNIQUEMENT sur le PREMIER message d'un inconnu.
-# Elle répond OUI si le message est lié aux activités de Chana Corporate,
-# NON pour tout le reste (bavardage, spam, messages privés hors-sujet...).
-#
-# ⚠️  Aucune alerte, aucune réponse client, aucun historique
-#     n'est créé si cette fonction retourne False.
+# 🔍 QUALIFICATION PROSPECT — Groq léger, timeout (3, 6)
+# Appelé UNIQUEMENT sur le premier message d'un inconnu.
+# Fail-open : si Groq timeout → on laisse passer.
 # ═══════════════════════════════════════════════════════════════
 def is_prospect(message: str) -> bool:
-    """
-    Filtre d'entrée : détermine si le message entrant justifie
-    d'engager la conversation commerciale.
-    Utilise un appel Groq minimaliste (max_tokens=5, temperature=0).
-    """
     try:
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {GROQ_API_KEY}"
-        }
-        payload = {
-            "model": "llama-3.3-70b-versatile",
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "Tu es un classificateur binaire. "
-                        "Réponds UNIQUEMENT par OUI ou NON, sans ponctuation, sans espace.\n\n"
-
-                        "Réponds OUI si le message indique que la personne est "
-                        "potentiellement intéressée par :\n"
-                        "- une mission commerciale en Chine\n"
-                        "- du sourcing, de l'importation, de l'exportation\n"
-                        "- des fournisseurs chinois, des usines, des produits\n"
-                        "- Chana Corporate, African Wind, le Zhejiang\n"
-                        "- un voyage d'affaires, une inscription, un forfait\n"
-                        "- des services commerciaux internationaux\n"
-                        "- une demande d'information commerciale ou professionnelle\n"
-                        "- une salutation simple (bonjour, bonsoir, allô, salut) "
-                        "— car elle peut venir d'un prospect qui commence à écrire\n\n"
-
-                        "Réponds NON si le message est clairement :\n"
-                        "- une discussion personnelle sans rapport (météo, blagues, "
-                        "politique, religion, sport, santé personnelle)\n"
-                        "- du spam ou un message publicitaire non sollicité\n"
-                        "- un message adressé à une autre personne par erreur\n"
-                        "- un message technique ou de test système\n\n"
-
-                        "En cas de doute, réponds OUI."
-                    )
-                },
-                {"role": "user", "content": message}
-            ],
-            "temperature": 0.0,
-            "max_tokens":  5
-        }
         res = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            json=payload, headers=headers, timeout=6
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Classificateur binaire. Réponds UNIQUEMENT OUI ou NON.\n\n"
+                            "OUI si le message vient d'un prospect potentiel : "
+                            "intérêt commercial, sourcing, importation, Chine, fournisseurs, "
+                            "voyage d'affaires, inscription, services professionnels, "
+                            "salutations simples (bonjour, bonsoir, allô, salut).\n\n"
+                            "NON si clairement hors-sujet : spam, blague, message personnel "
+                            "sans lien commercial, message erroné.\n\n"
+                            "En cas de doute → OUI."
+                        )
+                    },
+                    {"role": "user", "content": message}
+                ],
+                "temperature": 0.0,
+                "max_tokens":  5
+            },
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {GROQ_API_KEY}"
+            },
+            timeout=(3, 6)
         )
         if res.status_code != 200:
-            # Fail-open : si le filtre échoue, on laisse passer
-            print(f"⚠️  Filtre prospect KO ({res.status_code}) — fail-open")
+            print(f"⚠️  Filtre KO ({res.status_code}) — fail-open", flush=True)
             return True
-
         answer = res.json()["choices"][0]["message"]["content"].strip().upper()
         result = answer.startswith("OUI")
-        print(f"🔍 Qualification prospect : {'✅ OUI' if result else '❌ NON'} | msg='{message[:60]}'")
+        print(f"🔍 Prospect : {'✅ OUI' if result else '❌ NON'} | '{message[:50]}'", flush=True)
         return result
-
     except Exception as e:
-        # Fail-open : en cas d'erreur réseau ou autre, on laisse passer
-        print(f"⚠️  Filtre prospect EXCEPTION ({e}) — fail-open")
-        return True
+        print(f"⚠️  Filtre EXCEPTION ({e}) — fail-open", flush=True)
+        return True   # fail-open
 
 
 # ═══════════════════════════════════════════════════════════════
-# 🔍 DÉTECTION DEMANDE HUMAIN (mots-clés, rapide)
+# 🔍 DÉTECTION DEMANDE HUMAIN (mots-clés, pas d'appel réseau)
 # ═══════════════════════════════════════════════════════════════
 HUMAN_KEYWORDS = [
     "humain", "conseiller", "opérateur", "operateur",
@@ -239,71 +249,56 @@ HUMAN_KEYWORDS = [
 ]
 
 def wants_human(message: str) -> bool:
-    return any(kw in message.lower() for kw in HUMAN_KEYWORDS)
+    m = message.lower()
+    return any(kw in m for kw in HUMAN_KEYWORDS)
 
 
 # ═══════════════════════════════════════════════════════════════
-# 🤖 RÉPONSE IA (Groq) avec historique de conversation
+# 🤖 RÉPONSE IA (Groq) — timeout (3, 12) — historique glissant
 # ═══════════════════════════════════════════════════════════════
 SYSTEM_PROMPT = f"""Tu es CHANA ASSISTANT, l'assistant virtuel officiel de Chana Corporate.
 Tu représentes l'entreprise 24h/24 et 7j/7 sur WhatsApp.
 
-OBJECTIF PRINCIPAL :
-Accueillir chaleureusement le client, comprendre son besoin, présenter les services de manière naturelle et progressive, répondre à toutes ses questions, et l'amener vers l'inscription ou la prise de contact.
+OBJECTIF : Accueillir chaleureusement, comprendre le besoin, présenter les services progressivement, répondre à toutes les questions, amener vers l'inscription ou la prise de contact.
 
 RÈGLES :
 1. Réponds UNIQUEMENT en français.
-2. Ton naturel, chaleureux, professionnel — comme un vrai commercial humain.
-3. Présente les infos progressivement selon le fil de la conversation. Pas tout d'un coup.
-4. Réponds à TOUTES les questions posées sans en omettre aucune.
-5. Ne jamais inventer une information. Si inconnue : "Je transmettrai votre demande à un conseiller."
-6. Ne jamais discuter de politique, religion ou sujets hors Chana Corporate.
-7. NE PAS re-saluer à chaque message. Salue uniquement au tout premier échange.
-8. Si le client est prêt à s'inscrire, partage les liens officiels.
+2. Ton naturel, chaleureux, professionnel.
+3. Présente les infos progressivement — pas tout d'un coup.
+4. Réponds à TOUTES les questions sans en omettre aucune.
+5. Ne jamais inventer. Si inconnu : "Je transmettrai votre demande à un conseiller."
+6. Hors-sujet (politique, religion...) → décline poliment.
+7. NE PAS re-saluer à chaque message. Saluer uniquement au premier échange.
+8. Si le client est prêt à s'inscrire → partager les liens officiels.
 
 LIENS OFFICIELS :
-- Formulaire d'inscription en ligne : {LINK_FORM_ONLINE}
-- Brochure Mission Commerciale (PDF) : {LINK_BROCHURE}
-- Fiche d'inscription (PDF) : {LINK_FORM_PDF}
+- Formulaire en ligne : {LINK_FORM_ONLINE}
+- Brochure PDF : {LINK_BROCHURE}
+- Fiche inscription PDF : {LINK_FORM_PDF}
 
-PRÉSENTATION CHANA CORPORATE :
-Entreprise ivoirienne spécialisée dans l'accompagnement commercial international, mise en relation d'affaires, sourcing international, organisation de missions commerciales, accompagnement logistique et développement de partenariats stratégiques.
+CHANA CORPORATE :
+Entreprise ivoirienne — accompagnement commercial international, sourcing, missions commerciales, logistique, partenariats stratégiques.
 
-MISSION COMMERCIALE CHINE 2026 :
-- Dates : 22 au 31 juillet 2026 (10 jours)
-- Destination : Province de Zhejiang, Chine
-- Organisateurs : Chana Corporate & African Wind
-- Partenaire local : consortium de 1 000+ entreprises chinoises
+MISSION CHINE 2026 :
+Dates : 22–31 juillet 2026 (10 jours) | Zhejiang, Chine
+Organisateurs : Chana Corporate & African Wind
+Partenaires : consortium 1 000+ entreprises chinoises
 
-OBJECTIFS :
-Achat direct en usine · Réduction des intermédiaires · Marges améliorées · Fournisseurs fiables · Tarifs préférentiels · Réseau international · Partenariats durables
+OBJECTIFS : Achat direct usine · Réduction intermédiaires · Marges améliorées · Fournisseurs fiables · Tarifs préférentiels · Réseau international
 
-POURQUOI LE ZHEJIANG ?
-1 000+ entreprises partenaires · Berceau d'Alibaba et Geely · Marché de Yiwu · Infrastructures portuaires top · Prix plus bas que Guangzhou · Forte densité de PME
+ZHEJIANG : Berceau Alibaba & Geely · Marché Yiwu · Ports top · Prix < Guangzhou · Dense en PME
 
-SECTEURS :
-BTP · Automobile · Agriculture · Électroménager · Textile · Fournitures scolaires/bureau · Mobilier · Équipements médicaux · Énergies renouvelables · Commerce général
+SECTEURS : BTP · Auto · Agriculture · Électroménager · Textile · Fournitures · Mobilier · Médical · Énergies · Commerce général
 
-FORFAIT TOUT INCLUS :
-Visa business · Billet A/R · Hôtel 3-4 étoiles · 3 repas/jour · Rencontres B2B · Visites usines · Marché de Yiwu · Transport · Interprètes · Suivi commandes · Contrôle qualité · Livraison
+FORFAIT INCLUS : Visa · Billet A/R · Hôtel 3-4★ · 3 repas/j · B2B · Usines · Yiwu · Transport · Interprètes · Suivi commandes · Contrôle qualité
 
-PROGRAMME :
-J1-J2 : Accueil, briefing, découverte
-J3 : Rencontres B2B et réseautage
-J4-J6 : Visites usines + marché Yiwu
-J7-J8 : Négociations et commandes
-J9-J10 : Débriefing, visite portuaire, retour
+PROGRAMME : J1-2 Accueil/Briefing | J3 B2B | J4-6 Usines+Yiwu | J7-8 Négos+Commandes | J9-10 Débriefing+Retour
 
-TARIFICATION :
-Total : 2 500 000 FCFA/participant
-Acompte (40%) : 1 000 000 FCFA à l'inscription
-Solde (60%) : 1 500 000 FCFA avant le 1er juillet 2026
-Paiements : Mobile Money, espèces, chèque
+TARIF : 2 500 000 FCFA | Acompte 40% = 1 000 000 FCFA | Solde avant 1er juillet 2026
+Paiements : Mobile Money · Espèces · Chèque
 
-COORDONNÉES :
-WhatsApp : +225 05 00 02 60 72 | Tél : +225 27 22 23 66 83
-Email : chanacorporate@gmail.com
-Adresse : Cocody Riviera 3, Rue Kloé / Immeuble XL, Rue Dr Crozet"""
+CONTACTS : WhatsApp +225 05 00 02 60 72 | Tél +225 27 22 23 66 83 | chanacorporate@gmail.com
+Adresses : Cocody Riviera 3, Rue Kloé | Immeuble XL, Rue Dr Crozet"""
 
 
 def ask_groq(chat_id: str, message: str) -> str:
@@ -311,51 +306,52 @@ def ask_groq(chat_id: str, message: str) -> str:
         history = conversation_history.setdefault(chat_id, [])
         history.append({"role": "user", "content": message})
 
-        # Fenêtre glissante : max 20 messages (10 échanges)
-        if len(history) > 20:
-            history = history[-20:]
-            conversation_history[chat_id] = history
+        # Fenêtre glissante
+        if len(history) > HISTORY_MAX_MESSAGES:
+            conversation_history[chat_id] = history[-HISTORY_MAX_MESSAGES:]
+            history = conversation_history[chat_id]
 
-        start   = time.time()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {GROQ_API_KEY}"
-        }
-        payload = {
-            "model": "llama-3.3-70b-versatile",
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                *history
-            ],
-            "temperature": 0.4,
-            "max_tokens":  1024,
-            "top_p":       1
-        }
+        t0  = time.time()
         res = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            json=payload, headers=headers, timeout=15
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    *history
+                ],
+                "temperature": 0.4,
+                "max_tokens":  1024,
+                "top_p":       1
+            },
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {GROQ_API_KEY}"
+            },
+            timeout=(3, 12)
         )
-        duration = time.time() - start
 
         if res.status_code != 200:
-            print(f"❌ GROQ ERROR {res.status_code} : {res.text[:300]}")
-            return "Désolé, une erreur est survenue. Veuillez réessayer dans quelques instants."
+            print(f"❌ GROQ {res.status_code} : {res.text[:200]}", flush=True)
+            return "Désolé, une erreur est survenue. Veuillez réessayer."
 
         reply = res.json()["choices"][0]["message"]["content"].strip()
         history.append({"role": "assistant", "content": reply})
-        print(f"🤖 Groq OK ({duration:.2f}s) | échanges={len(history)//2}")
+        print(f"🤖 Groq OK ({time.time()-t0:.2f}s) échanges={len(history)//2}", flush=True)
         return reply
 
-    except requests.Timeout:
+    except requests.exceptions.ConnectTimeout:
+        return "Je mets un peu de temps à répondre, merci de patienter et renvoyez votre question. 🙏"
+    except requests.exceptions.ReadTimeout:
         return "Je réfléchis encore… merci de patienter puis renvoyez votre question. 🙏"
     except Exception as e:
-        print(f"❌ GROQ EXCEPTION: {e}")
+        print(f"❌ GROQ EXCEPTION : {e}", flush=True)
         return "Le service est momentanément indisponible. Veuillez réessayer."
 
 
-# ─────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 # 🛡️ ANTI-DOUBLON
-# ─────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 def is_duplicate(msg_id: str) -> bool:
     if msg_id in processed_messages:
         return True
@@ -364,12 +360,117 @@ def is_duplicate(msg_id: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 📩 WEBHOOK PRINCIPAL
+# ⚙️  WORKER — traitement async des messages
+#
+# Le webhook dépose un dict dans work_queue et retourne 202 immédiatement.
+# Ce worker tourne en boucle infinie dans son propre thread.
+# En cas d'exception non catchée, il log et continue (pas de crash silencieux).
+# ═══════════════════════════════════════════════════════════════
+def process_job(job: dict):
+    """Traite un message entrant : qualification, IA, envoi, alertes."""
+    chat_id = job["chat_id"]
+    message = job["message"]
+
+    try:
+        state = user_state.get(chat_id)
+
+        # ── Porte d'entrée : qualification prospect ───────────
+        if state is None:
+            if not is_prospect(message):
+                print(f"🚫 Non-prospect ignoré : {chat_id} | '{message[:50]}'", flush=True)
+                return
+            print(f"✅ Nouveau prospect : {chat_id}", flush=True)
+            user_state[chat_id] = {
+                "step":       "ai",
+                "exchanges":  0,
+                "escalated":  False,
+                "created_at": time.time(),
+                "last_seen":  time.time(),
+            }
+            state = user_state[chat_id]
+
+        # Mise à jour last_seen (pour TTL)
+        state["last_seen"] = time.time()
+        step = state["step"]
+
+        # ── Mode humain : bot silencieux ──────────────────────
+        if step == "human":
+            print(f"🔕 Silencieux ({chat_id})", flush=True)
+            return
+
+        # ── Mode IA ───────────────────────────────────────────
+        if step == "ai":
+
+            # Demande humain explicite
+            if wants_human(message):
+                state["step"]      = "human"
+                state["escalated"] = True
+                send_whatsapp(
+                    chat_id,
+                    "Bien sûr ! 🙏 Je vous mets immédiatement en contact avec un "
+                    "conseiller Chana Corporate.\n\n"
+                    "Un membre de notre équipe va vous répondre très rapidement.\n"
+                    "Vous pouvez aussi nous joindre directement :\n"
+                    "📞 +225 27 22 23 66 83\n"
+                    "📧 chanacorporate@gmail.com"
+                )
+                alert_operator_human_request(chat_id, message)
+                return
+
+            # Réponse IA
+            reply = ask_groq(chat_id, message)
+            state["exchanges"] += 1
+            send_whatsapp(chat_id, reply)
+
+            exchanges = state["exchanges"]
+            print(f"💬 Échange #{exchanges} | {chat_id}", flush=True)
+
+            # Escalade auto après 5 échanges
+            if exchanges >= 5 and not state["escalated"]:
+                state["escalated"] = True
+                state["step"]      = "human"
+                send_whatsapp(
+                    chat_id,
+                    "Merci pour cet échange enrichissant ! 😊\n\n"
+                    "Afin de mieux vous accompagner, je vous mets maintenant en contact "
+                    "avec l'un de nos conseillers Chana Corporate.\n\n"
+                    "Il va vous recontacter très prochainement. 🙏\n\n"
+                    "En attendant, voici nos documents officiels :\n"
+                    f"📄 Brochure : {LINK_BROCHURE}\n"
+                    f"📝 Fiche d'inscription : {LINK_FORM_PDF}\n"
+                    f"🌐 Inscription en ligne : {LINK_FORM_ONLINE}"
+                )
+                alert_operator_escalation(chat_id, message)
+
+    except Exception as e:
+        print(f"❌ WORKER EXCEPTION [{chat_id}] : {e}", flush=True)
+        traceback.print_exc()
+
+
+def worker_loop():
+    """Boucle infinie du worker. Résistant aux exceptions."""
+    print("⚙️  Worker async démarré.", flush=True)
+    while True:
+        try:
+            job = work_queue.get(timeout=30)   # timeout pour ne pas bloquer indéfiniment
+            process_job(job)
+            work_queue.task_done()
+        except queue.Empty:
+            continue   # pas de job, on boucle
+        except Exception as e:
+            # Log complet, mais le worker ne crashe pas
+            print(f"❌ WORKER LOOP ERROR : {e}", flush=True)
+            traceback.print_exc()
+
+
+threading.Thread(target=worker_loop, daemon=True, name="AsyncWorker").start()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 📩 WEBHOOK — répond en < 200ms, délègue au worker
 # ═══════════════════════════════════════════════════════════════
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    start_time = time.time()
-
     try:
         data = request.get_json(force=True, silent=True)
         if not data:
@@ -385,162 +486,57 @@ def webhook():
         message = msg_data.get("textMessageData", {}).get("textMessage", "").strip()
         msg_id  = data.get("idMessage", "")
 
-        # ── Filtres système ───────────────────────────────────
+        # Filtres système (rapides, pas d'appel réseau)
         if chat_id.endswith("@g.us"):
             return jsonify({"ignored": True, "reason": "group_message"})
-
         if BOT_OWN_NUMBER and chat_id == BOT_OWN_NUMBER:
             return jsonify({"ignored": True, "reason": "self_message"})
-
         if not chat_id or not message:
-            return jsonify({"error": "Missing data"}), 200
-
+            return jsonify({"ok": True, "reason": "empty"}), 200
         if msg_id and is_duplicate(msg_id):
-            print(f"⛔ Doublon ignoré : {msg_id}")
             return jsonify({"ignored": True, "reason": "duplicate"})
 
-        print(f"\n📩 [{chat_id}] : {message[:100]}")
+        # Dépôt dans la file (non-bloquant)
+        try:
+            work_queue.put_nowait({"chat_id": chat_id, "message": message, "msg_id": msg_id})
+            print(f"📩 Enqueued [{chat_id}] : {message[:60]}", flush=True)
+        except queue.Full:
+            # File pleine → log mais on ne crashe pas
+            print(f"⚠️  Queue pleine — message de {chat_id} ignoré.", flush=True)
+            return jsonify({"error": "queue_full"}), 503
 
-        state = user_state.get(chat_id)
-
-        # ══════════════════════════════════════════════════════
-        # 🔍 PORTE D'ENTRÉE — QUALIFICATION PROSPECT
-        #
-        # Si on ne connaît pas encore ce numéro, on qualifie
-        # AVANT de faire quoi que ce soit.
-        # Aucune réponse, aucune alerte, aucun historique
-        # n'est créé si le message ne concerne pas Chana.
-        # ══════════════════════════════════════════════════════
-        if state is None:
-            if not is_prospect(message):
-                print(f"🚫 Ignoré (hors-sujet, inconnu) : {chat_id} | '{message[:60]}'")
-                return jsonify({
-                    "ignored": True,
-                    "reason":  "not_a_prospect",
-                    "chat_id": chat_id
-                })
-
-            # ✅ Prospect qualifié → initialisation
-            print(f"✅ Nouveau prospect qualifié : {chat_id}")
-            user_state[chat_id] = {
-                "step":       "ai",
-                "exchanges":  0,
-                "escalated":  False,
-                "created_at": time.time(),
-            }
-            state = user_state[chat_id]
-
-        step = state["step"]
-
-        # ══════════════════════════════════════════════════════
-        # 🔕 MODE HUMAIN — bot silencieux
-        # ══════════════════════════════════════════════════════
-        if step == "human":
-            print(f"🔕 Bot silencieux pour {chat_id} (pris en charge)")
-            return jsonify({"ignored": True, "reason": "human_mode", "chat_id": chat_id})
-
-        # ══════════════════════════════════════════════════════
-        # 🤖 MODE IA
-        # ══════════════════════════════════════════════════════
-        if step == "ai":
-
-            # ── Demande humain explicite ──────────────────────
-            if wants_human(message):
-                state["step"]      = "human"
-                state["escalated"] = True
-                send_whatsapp(
-                    chat_id,
-                    "Bien sûr ! 🙏 Je vous mets immédiatement en contact avec un "
-                    "conseiller Chana Corporate.\n\n"
-                    "Un membre de notre équipe va vous répondre très rapidement.\n"
-                    "Vous pouvez aussi nous joindre directement :\n"
-                    "📞 +225 27 22 23 66 83\n"
-                    "📧 chanacorporate@gmail.com"
-                )
-                alert_operator_human_request(chat_id, message)
-                return jsonify({
-                    "success": True,
-                    "action":  "human_escalation_explicit",
-                    "chat_id": chat_id,
-                    "duration": f"{time.time() - start_time:.2f}s"
-                })
-
-            # ── Réponse IA normale ────────────────────────────
-            reply = ask_groq(chat_id, message)
-            state["exchanges"] += 1
-            send_whatsapp(chat_id, reply)
-
-            exchanges = state["exchanges"]
-            print(f"💬 Échange #{exchanges} | {chat_id}")
-
-            # ── Escalade auto après 5 échanges ───────────────
-            if exchanges >= 5 and not state["escalated"]:
-                state["escalated"] = True
-                state["step"]      = "human"
-
-                send_whatsapp(
-                    chat_id,
-                    "Merci pour cet échange enrichissant ! 😊\n\n"
-                    "Afin de mieux vous accompagner, je vous mets maintenant en contact "
-                    "avec l'un de nos conseillers Chana Corporate.\n\n"
-                    "Il va vous recontacter très prochainement. 🙏\n\n"
-                    "En attendant, voici nos documents officiels :\n"
-                    f"📄 Brochure : {LINK_BROCHURE}\n"
-                    f"📝 Fiche d'inscription : {LINK_FORM_PDF}\n"
-                    f"🌐 Inscription en ligne : {LINK_FORM_ONLINE}"
-                )
-                alert_operator_escalation(chat_id, message)
-
-                return jsonify({
-                    "success":   True,
-                    "action":    "ai_reply_then_escalation",
-                    "exchanges": exchanges,
-                    "chat_id":   chat_id,
-                    "duration":  f"{time.time() - start_time:.2f}s"
-                })
-
-            return jsonify({
-                "success":   True,
-                "action":    "ai_reply",
-                "exchanges": exchanges,
-                "chat_id":   chat_id,
-                "duration":  f"{time.time() - start_time:.2f}s"
-            })
-
-        return jsonify({"error": "Unknown step", "step": step}), 500
+        # Réponse immédiate à Green API (< 200ms garanti)
+        return jsonify({"ok": True, "queued": True}), 202
 
     except Exception as e:
-        print(f"\n❌ CRITICAL ERROR: {e}")
+        print(f"❌ WEBHOOK EXCEPTION : {e}", flush=True)
         traceback.print_exc()
-        return jsonify({
-            "error":    str(e),
-            "duration": f"{time.time() - start_time:.2f}s"
-        }), 500
+        return jsonify({"error": str(e)}), 500
 
 
 # ═══════════════════════════════════════════════════════════════
-# 🧪 TEST ENVOI WHATSAPP
+# 🏓 /ping — keep-alive pour Render (à appeler toutes les 14 min)
+# ═══════════════════════════════════════════════════════════════
+@app.route("/ping", methods=["GET"])
+def ping():
+    return jsonify({"pong": True, "ts": time.time()}), 200
+
+
+# ═══════════════════════════════════════════════════════════════
+# 🧪 /test-whatsapp — vérifie que l'envoi WA fonctionne
 # ═══════════════════════════════════════════════════════════════
 @app.route("/test-whatsapp", methods=["GET"])
-def route_test_whatsapp():
+def test_whatsapp():
     ts  = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    msg = (
-        f"🧪 *TEST BOT CHANA CORPORATE*\n\n"
-        f"✅ Le bot est opérationnel.\n"
-        f"⏱️  Heure : {ts}\n\n"
-        f"Si vous recevez ce message, les alertes fonctionnent correctement."
+    ok  = send_whatsapp(
+        OPERATOR_CHAT_ID,
+        f"🧪 *TEST BOT CHANA CORPORATE*\n\n✅ Bot opérationnel.\n⏱️ {ts}"
     )
-    print(f"\n🧪 Test d'envoi → '{OPERATOR_CHAT_ID}'")
-    ok = send_whatsapp(OPERATOR_CHAT_ID, msg)
-    return jsonify({
-        "test":    "whatsapp_send",
-        "target":  OPERATOR_CHAT_ID,
-        "success": ok
-    })
+    return jsonify({"success": ok, "target": OPERATOR_CHAT_ID})
 
 
 # ═══════════════════════════════════════════════════════════════
-# 🏥 HEALTH CHECK
+# 🏥 / — health check complet
 # ═══════════════════════════════════════════════════════════════
 @app.route("/", methods=["GET"])
 def health():
@@ -551,29 +547,33 @@ def health():
 
     return jsonify({
         "status":             "ok",
-        "service":            "Chana Corporate WhatsApp Bot v7",
+        "service":            "Chana Corporate WhatsApp Bot v8",
         "model":              "llama-3.3-70b-versatile",
         "operator_target":    OPERATOR_CHAT_ID or "⚠️ NON CONFIGURÉ",
-        "bot_own_number":     BOT_OWN_NUMBER   or "⚠️ NON CONFIGURÉ",
+        "queue_size":         work_queue.qsize(),
         "total_users":        len(user_state),
         "processed_messages": len(processed_messages),
-        "steps_breakdown":    steps
+        "steps_breakdown":    steps,
+        "memory_ttl_hours":   MEMORY_TTL_SECONDS // 3600,
     })
 
 
 # ═══════════════════════════════════════════════════════════════
 # 🚀 DÉMARRAGE
 # ═══════════════════════════════════════════════════════════════
+check_env()
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-    check_env()
     print(f"""
-    ╔══════════════════════════════════════════════╗
-    ║   🤖  CHANA CORPORATE BOT  v7.0  READY      ║
-    ║   Port      : {port}                           ║
-    ║   Filtre    : qualification prospect active  ║
-    ║   Escalade  : après 5 échanges IA            ║
-    ║   Test      : GET /test-whatsapp             ║
-    ╚══════════════════════════════════════════════╝
-    """)
+    ╔══════════════════════════════════════════════════╗
+    ║   🤖  CHANA CORPORATE BOT  v8.0  READY          ║
+    ║   Port       : {port}                              ║
+    ║   Webhook    : async < 200ms (queue)             ║
+    ║   Mémoire    : TTL {MEMORY_TTL_SECONDS//3600}h — nettoyage /30min        ║
+    ║   Timeouts   : connect=3s / read=10-12s          ║
+    ║   Keep-alive : GET /ping                         ║
+    ║   Test WA    : GET /test-whatsapp                ║
+    ╚══════════════════════════════════════════════════╝
+    """, flush=True)
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
