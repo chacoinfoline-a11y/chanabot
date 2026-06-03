@@ -1,12 +1,11 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║        CHANA CORPORATE WHATSAPP BOT  v10.0                  ║
+║        CHANA CORPORATE WHATSAPP BOT  v11.0                  ║
 ║        Render stable — threading par requête                ║
 ╠══════════════════════════════════════════════════════════════╣
-║  Commande Start Render :                                    ║
-║  gunicorn main:app --bind 0.0.0.0:$PORT --workers 1        ║
-║  --threads 8 --timeout 120                                  ║
-║  (PAS de --preload — inutile sans queue inter-process)      ║
+║  Start Command Render :                                     ║
+║  gunicorn main:app --bind 0.0.0.0:$PORT                    ║
+║  --workers 1 --threads 8 --timeout 120                     ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -31,9 +30,9 @@ BOT_OWN_NUMBER   = os.getenv("BOT_OWN_NUMBER",   "")
 
 GREEN_API_BASE = f"https://api.green-api.com/waInstance{ID_INSTANCE}"
 
-MEMORY_TTL      = 7_200   # 2h
-HISTORY_MAX     = 20
-ESCALADE_SEUIL  = 5
+MEMORY_TTL     = 7_200   # 2h
+HISTORY_MAX    = 20
+ESCALADE_SEUIL = 5
 
 # ─────────────────────────────────────────
 # 🔗 LIENS OFFICIELS
@@ -43,17 +42,18 @@ LINK_PDF   = "https://drive.google.com/file/d/1QtZaRDUHgVsRIal05i7RuhvVVz1gnZEz/
 LINK_BROCH = "https://drive.google.com/file/d/1YEEsJEDARjkb2QBk1dw3SVDtVNm9O7p0/view?usp=sharing"
 
 # ═══════════════════════════════════════════════════════════════
-# 🗂️  MÉMOIRE (partagée dans le même process — 1 worker Gunicorn)
+# 🗂️  MÉMOIRE
 # ═══════════════════════════════════════════════════════════════
 user_state:           dict = {}
 conversation_history: dict = {}
 processed_messages:   set  = set()
-_state_lock = threading.Lock()   # protection multi-thread
+_state_lock = threading.Lock()
 
 stats = {
     "started_at":     datetime.now().isoformat(),
     "jobs_processed": 0,
     "jobs_failed":    0,
+    "ignored_offtopic": 0,
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -92,7 +92,7 @@ def _memory_cleanup():
                 if len(processed_messages) > 3_000:
                     processed_messages.clear()
             if expired:
-                print(f"🧹 {len(expired)} session(s) expirée(s) supprimée(s)", flush=True)
+                print(f"🧹 {len(expired)} session(s) expirée(s)", flush=True)
         except Exception as e:
             print(f"⚠️  cleanup error : {e}", flush=True)
 
@@ -106,7 +106,7 @@ def send_whatsapp(chat_id: str, message: str) -> bool:
         print("❌ SEND: chat_id vide", flush=True)
         return False
     if BOT_OWN_NUMBER and chat_id == BOT_OWN_NUMBER:
-        print(f"❌ SEND: self-send bloqué", flush=True)
+        print("❌ SEND: self-send bloqué", flush=True)
         return False
     url = f"{GREEN_API_BASE}/sendMessage/{API_TOKEN}"
     try:
@@ -155,9 +155,87 @@ def alert_human_request(chat_id: str, msg: str):
     )
 
 # ═══════════════════════════════════════════════════════════════
-# 🔍 QUALIFICATION PROSPECT
+# 🔍 FILTRE DE PERTINENCE — VERSION STRICTE
+#
+# LOGIQUE :
+#   1. Mots-clés positifs → OUI immédiat (zéro appel Groq)
+#   2. Mots-clés négatifs → NON immédiat (zéro appel Groq)
+#   3. Zone grise → classification Groq légère
+#
+# Une salutation seule ("bonjour", "bonsoir") sans contexte
+# commercial = IGNORÉE.
+# Si la salutation vient après une pub Facebook ou contient
+# un mot déclencheur commercial = acceptée.
 # ═══════════════════════════════════════════════════════════════
-def is_prospect(message: str) -> bool:
+
+# Déclencheurs positifs certains → répondre sans appel Groq
+POSITIVE_KEYWORDS = [
+    "chine", "chana", "zhejiang", "yiwu", "mission commerciale",
+    "voyage", "fournisseur", "usine", "sourcing", "importation",
+    "importateur", "exportation", "produit", "commande",
+    "inscription", "s'inscrire", "inscrire", "forfait", "tarif",
+    "prix", "acompte", "paiement", "visa", "billet", "hôtel",
+    "african wind", "pub", "publicité", "facebook", "annonce",
+    "votre annonce", "votre pub", "j'ai vu", "j'ai lu",
+    "intéressé", "interesse", "renseignement", "information",
+    "comment ça marche", "comment ca marche", "c'est quoi",
+    "c'est combien", "brochure", "fiche", "formulaire",
+    "btp", "automobile", "textile", "électroménager",
+    "agriculture", "mobilier", "médical", "énergie",
+]
+
+# Déclencheurs négatifs certains → ignorer sans appel Groq
+NEGATIVE_KEYWORDS = [
+    "météo", "meteo", "foot", "football", "ballon",
+    "recette", "cuisine", "restaurant", "match",
+    "politique", "élection", "election", "président",
+    "religion", "dieu", "prière", "priere", "église",
+    "blague", "joke", "lol", "haha", "mdr",
+    "amour", "chéri", "cherie", "copine", "copain",
+    "whatsapp", "sms", "appel manqué", "appel manque",
+]
+
+# Salutations seules — zone grise (sans contexte commercial)
+GREETINGS_ONLY = [
+    "bonjour", "bonsoir", "salut", "allô", "allo",
+    "hello", "hi", "hey", "coucou", "bonne journée",
+    "bonne journee", "bonne nuit", "bjr", "bsr",
+]
+
+
+def _is_greeting_only(message: str) -> bool:
+    """Retourne True si le message est UNIQUEMENT une salutation sans contexte."""
+    clean = message.lower().strip().rstrip("!.,?")
+    return clean in GREETINGS_ONLY
+
+
+def is_relevant(message: str) -> bool:
+    """
+    Filtre de pertinence à 3 niveaux.
+    Retourne True si le bot doit répondre.
+    """
+    msg_lower = message.lower()
+
+    # ── Niveau 1 : mots-clés négatifs → NON immédiat ─────────
+    if any(kw in msg_lower for kw in NEGATIVE_KEYWORDS):
+        print(f"🚫 Mot-clé négatif détecté → ignoré", flush=True)
+        return False
+
+    # ── Niveau 2 : mots-clés positifs → OUI immédiat ─────────
+    if any(kw in msg_lower for kw in POSITIVE_KEYWORDS):
+        print(f"✅ Mot-clé positif détecté → pertinent", flush=True)
+        return True
+
+    # ── Niveau 3 : salutation seule → ignorée ─────────────────
+    # Une salutation sans aucun contexte commercial = probablement
+    # un mauvais numéro ou un message personnel. On n'engage pas.
+    if _is_greeting_only(message):
+        print(f"🔕 Salutation seule → ignorée (pas de contexte commercial)", flush=True)
+        return False
+
+    # ── Niveau 4 : zone grise → classification Groq légère ───
+    # Seulement si le message n'est ni positif, ni négatif, ni
+    # une salutation seule (ex: phrase ambiguë de 10+ mots)
     try:
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -167,13 +245,22 @@ def is_prospect(message: str) -> bool:
                     {
                         "role": "system",
                         "content": (
-                            "Classificateur binaire. Réponds UNIQUEMENT OUI ou NON.\n\n"
-                            "OUI → prospect potentiel : intérêt commercial, sourcing, "
-                            "importation, Chine, fournisseurs, voyage affaires, inscription, "
-                            "services pro, ou simple salutation (bonjour, bonsoir, allô).\n\n"
-                            "NON → clairement hors-sujet : spam, blague, message perso sans "
-                            "rapport commercial, politique, religion.\n\n"
-                            "En cas de doute → OUI."
+                            "Tu es un classificateur strict pour un bot commercial WhatsApp "
+                            "d'une entreprise ivoirienne organisant des voyages d'affaires "
+                            "en Chine (Chana Corporate).\n\n"
+                            "Réponds UNIQUEMENT OUI ou NON.\n\n"
+                            "OUI uniquement si le message exprime clairement :\n"
+                            "- un intérêt pour une mission commerciale, voyage d'affaires, "
+                            "sourcing, importation/exportation, fournisseurs chinois\n"
+                            "- une question sur les services ou tarifs de l'entreprise\n"
+                            "- une demande suite à une publicité Facebook/Instagram\n"
+                            "- une intention d'achat ou d'inscription\n\n"
+                            "NON dans TOUS les autres cas, notamment :\n"
+                            "- salutations sans contexte commercial\n"
+                            "- conversations personnelles\n"
+                            "- sujets sans rapport avec le commerce international\n"
+                            "- messages ambigus sans intention commerciale claire\n\n"
+                            "Sois STRICT. En cas de doute → NON."
                         )
                     },
                     {"role": "user", "content": message}
@@ -188,15 +275,24 @@ def is_prospect(message: str) -> bool:
             timeout=(3, 6)
         )
         if r.status_code != 200:
-            print(f"⚠️ Filtre KO ({r.status_code}) — fail-open", flush=True)
+            # Fail-open uniquement si l'API est down
+            print(f"⚠️ Filtre Groq KO ({r.status_code}) — fail-open", flush=True)
             return True
+
         answer = r.json()["choices"][0]["message"]["content"].strip().upper()
         result = answer.startswith("OUI")
-        print(f"🔍 Prospect : {'✅ OUI' if result else '❌ NON'} | '{message[:50]}'", flush=True)
+        print(
+            f"🔍 Classification Groq : {'✅ OUI' if result else '❌ NON'} "
+            f"| '{message[:50]}'",
+            flush=True
+        )
         return result
+
     except Exception as e:
+        # Fail-open si réseau down, pas si message suspect
         print(f"⚠️ Filtre exception ({e}) — fail-open", flush=True)
         return True
+
 
 # ═══════════════════════════════════════════════════════════════
 # 🔍 DÉTECTION DEMANDE HUMAIN
@@ -207,8 +303,7 @@ HUMAN_KEYWORDS = [
     "rendez-vous", "rendez vous", "parler à", "parler a",
     "je veux parler", "une personne", "vrai personne",
     "pas un robot", "pas un bot", "réclamation", "reclamation",
-    "négocier", "negocier", "partenariat", "dossier",
-    "directeur", "gérant", "gerant",
+    "négocier", "negocier", "dossier", "directeur", "gérant", "gerant",
 ]
 
 def wants_human(message: str) -> bool:
@@ -220,13 +315,18 @@ def wants_human(message: str) -> bool:
 SYSTEM_PROMPT = f"""Tu es CHANA ASSISTANT, l'assistant virtuel officiel de Chana Corporate.
 Tu représentes l'entreprise 24h/24 et 7j/7 sur WhatsApp.
 
+CONTEXTE IMPORTANT :
+Certains prospects arrivent via une campagne publicitaire Facebook/Instagram.
+Ils peuvent écrire des choses comme "j'ai vu votre pub", "votre annonce Facebook", "c'est quoi exactement ?".
+Traite-les exactement comme n'importe quel prospect — accueil chaleureux, présentation progressive.
+
 OBJECTIF : Accueillir chaleureusement, comprendre le besoin, présenter les services progressivement, répondre à toutes les questions, amener vers l'inscription ou la prise de contact.
 
 RÈGLES :
 1. Réponds UNIQUEMENT en français.
-2. Ton naturel, chaleureux, professionnel.
+2. Ton naturel, chaleureux, professionnel — comme un vrai commercial.
 3. Présente les infos progressivement — pas tout d'un coup.
-4. Réponds à TOUTES les questions sans en omettre aucune.
+4. Réponds à TOUTES les questions posées sans en omettre aucune.
 5. Ne jamais inventer. Si inconnu : "Je transmettrai votre demande à un conseiller."
 6. Hors-sujet → décline poliment.
 7. NE PAS re-saluer à chaque message. Saluer uniquement au premier échange.
@@ -259,6 +359,7 @@ Paiements : Mobile Money · Espèces · Chèque
 
 CONTACTS : WhatsApp +225 05 00 02 60 72 | Tél +225 27 22 23 66 83 | chanacorporate@gmail.com
 Adresses : Cocody Riviera 3, Rue Kloé | Immeuble XL, Rue Dr Crozet"""
+
 
 def ask_groq(chat_id: str, message: str) -> str:
     history = conversation_history.setdefault(chat_id, [])
@@ -312,36 +413,36 @@ def is_duplicate(msg_id: str) -> bool:
 
 # ═══════════════════════════════════════════════════════════════
 # ⚙️  TRAITEMENT D'UN MESSAGE
-# Appelé dans un thread dédié par requête webhook
 # ═══════════════════════════════════════════════════════════════
 def handle_message(chat_id: str, message: str):
     try:
         with _state_lock:
             state = user_state.get(chat_id)
 
-        # ── Qualification prospect (premier message seulement) ─
+        # ── NOUVEAU NUMÉRO — filtre strict avant tout ─────────
         if state is None:
-            if not is_prospect(message):
-                print(f"🚫 Non-prospect : {chat_id} | '{message[:50]}'", flush=True)
+            if not is_relevant(message):
+                stats["ignored_offtopic"] += 1
+                print(f"🚫 Ignoré [{chat_id}] : '{message[:60]}'", flush=True)
                 return
-            print(f"✅ Nouveau prospect : {chat_id}", flush=True)
+            print(f"✅ Nouveau prospect qualifié : {chat_id}", flush=True)
             now = time.time()
-            new_state = {
-                "step":       "ai",
-                "exchanges":  0,
-                "escalated":  False,
-                "created_at": now,
-                "last_seen":  now,
-            }
             with _state_lock:
-                user_state[chat_id] = new_state
+                user_state[chat_id] = {
+                    "step":       "ai",
+                    "exchanges":  0,
+                    "escalated":  False,
+                    "created_at": now,
+                    "last_seen":  now,
+                }
                 state = user_state[chat_id]
 
+        # Mise à jour last_seen
         with _state_lock:
             state["last_seen"] = time.time()
             step = state["step"]
 
-        # ── Bot silencieux ────────────────────────────────────
+        # ── Bot silencieux (humain en charge) ─────────────────
         if step == "human":
             print(f"🔕 Silencieux {chat_id}", flush=True)
             return
@@ -402,7 +503,7 @@ def handle_message(chat_id: str, message: str):
         traceback.print_exc()
 
 # ═══════════════════════════════════════════════════════════════
-# 📩 WEBHOOK — répond immédiatement, lance un thread par message
+# 📩 WEBHOOK
 # ═══════════════════════════════════════════════════════════════
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -420,7 +521,6 @@ def webhook():
         message  = msg_data.get("textMessageData", {}).get("textMessage", "").strip()
         msg_id   = data.get("idMessage", "")
 
-        # Filtres rapides
         if chat_id.endswith("@g.us"):
             return jsonify({"ignored": True, "reason": "group"})
         if BOT_OWN_NUMBER and chat_id == BOT_OWN_NUMBER:
@@ -432,7 +532,6 @@ def webhook():
 
         print(f"📩 [{chat_id}] '{message[:70]}'", flush=True)
 
-        # Thread dédié — webhook répond immédiatement
         threading.Thread(
             target=handle_message,
             args=(chat_id, message),
@@ -464,10 +563,11 @@ def health():
         steps[k] = steps.get(k, 0) + 1
     return jsonify({
         "status":             "ok",
-        "service":            "Chana Corporate WhatsApp Bot v10",
+        "service":            "Chana Corporate WhatsApp Bot v11",
         "started_at":         stats["started_at"],
         "jobs_processed":     stats["jobs_processed"],
         "jobs_failed":        stats["jobs_failed"],
+        "ignored_offtopic":   stats["ignored_offtopic"],
         "total_users":        len(user_state),
         "processed_messages": len(processed_messages),
         "steps_breakdown":    steps,
@@ -480,7 +580,7 @@ def test_whatsapp():
     ts = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     ok = send_whatsapp(
         OPERATOR_CHAT_ID,
-        f"🧪 *TEST BOT CHANA CORPORATE v10*\n\n✅ Bot opérationnel.\n⏱️ {ts}"
+        f"🧪 *TEST BOT CHANA CORPORATE v11*\n\n✅ Bot opérationnel.\n⏱️ {ts}"
     )
     return jsonify({"success": ok, "target": OPERATOR_CHAT_ID})
 
