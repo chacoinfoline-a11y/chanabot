@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║        CHANA CORPORATE WHATSAPP BOT  v11.0                  ║
+║        CHANA CORPORATE WHATSAPP BOT  v11.1                  ║
 ║        Render stable — threading par requête                ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Start Command Render :                                     ║
@@ -13,6 +13,7 @@ from flask import Flask, request, jsonify
 import requests
 import os
 import time
+import signal
 import threading
 import traceback
 from datetime import datetime
@@ -42,6 +43,39 @@ LINK_PDF   = "https://drive.google.com/file/d/1QtZaRDUHgVsRIal05i7RuhvVVz1gnZEz/
 LINK_BROCH = "https://drive.google.com/file/d/1YEEsJEDARjkb2QBk1dw3SVDtVNm9O7p0/view?usp=sharing"
 
 # ═══════════════════════════════════════════════════════════════
+# 📊 STATE GLOBAL (uptime, santé, stats)
+# ═══════════════════════════════════════════════════════════════
+STATE = {
+    "started_at":   time.time(),
+    "last_webhook": None,
+    "messages":     0,
+    "alive":        True,
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 🚨 SIGNAL SIGTERM — détecte redéploiement / maintenance Render
+# ═══════════════════════════════════════════════════════════════
+def _sigterm(sig, frame):
+    print("🚨 SIGTERM reçu (redéploiement ou maintenance Render)", flush=True)
+    STATE["alive"] = False
+
+signal.signal(signal.SIGTERM, _sigterm)
+
+# ═══════════════════════════════════════════════════════════════
+# 💓 HEARTBEAT — log toutes les 15s pour prouver que le process vit
+# ═══════════════════════════════════════════════════════════════
+def _heartbeat():
+    while True:
+        up = int(time.time() - STATE["started_at"])
+        print(
+            f"💓 alive | up={up}s | msg={STATE['messages']} | last={STATE['last_webhook']}",
+            flush=True
+        )
+        time.sleep(15)
+
+threading.Thread(target=_heartbeat, daemon=True, name="Heartbeat").start()
+
+# ═══════════════════════════════════════════════════════════════
 # 🗂️  MÉMOIRE
 # ═══════════════════════════════════════════════════════════════
 user_state:           dict = {}
@@ -50,9 +84,9 @@ processed_messages:   set  = set()
 _state_lock = threading.Lock()
 
 stats = {
-    "started_at":     datetime.now().isoformat(),
-    "jobs_processed": 0,
-    "jobs_failed":    0,
+    "started_at":       datetime.now().isoformat(),
+    "jobs_processed":   0,
+    "jobs_failed":      0,
     "ignored_offtopic": 0,
 }
 
@@ -155,17 +189,16 @@ def alert_human_request(chat_id: str, msg: str):
     )
 
 # ═══════════════════════════════════════════════════════════════
-# 🔍 FILTRE DE PERTINENCE — VERSION STRICTE
+# 🔍 FILTRE DE PERTINENCE
 #
 # LOGIQUE :
-#   1. Mots-clés positifs → OUI immédiat (zéro appel Groq)
-#   2. Mots-clés négatifs → NON immédiat (zéro appel Groq)
-#   3. Patterns d'intérêt → OUI immédiat (questions génériques, refs pub)
-#   4. Salutation seule → ignorée
-#   5. Zone grise → classification Groq légère
+#   1. Mots-clés négatifs  → NON immédiat (zéro appel Groq)
+#   2. Mots-clés positifs  → OUI immédiat (zéro appel Groq)
+#   3. Patterns d'intérêt  → OUI immédiat (questions génériques, refs pub)
+#   4. Salutation seule    → ignorée
+#   5. Zone grise          → classification Groq légère
 # ═══════════════════════════════════════════════════════════════
 
-# Déclencheurs positifs certains → répondre sans appel Groq
 POSITIVE_KEYWORDS = [
     # ── Entreprise & destination ──
     "chine", "chana", "zhejiang", "yiwu", "mission commerciale",
@@ -201,7 +234,6 @@ POSITIVE_KEYWORDS = [
     "puis-je", "puis je", "may i", "could you",
 ]
 
-# Déclencheurs négatifs certains → ignorer sans appel Groq
 NEGATIVE_KEYWORDS = [
     "météo", "meteo", "foot", "football", "ballon",
     "recette", "cuisine", "restaurant", "match",
@@ -212,7 +244,6 @@ NEGATIVE_KEYWORDS = [
     "whatsapp", "sms", "appel manqué", "appel manque",
 ]
 
-# Salutations seules — zone grise (sans contexte commercial)
 GREETINGS_ONLY = [
     "bonjour", "bonsoir", "salut", "allô", "allo",
     "hello", "hi", "hey", "coucou", "bonne journée",
@@ -221,6 +252,7 @@ GREETINGS_ONLY = [
 
 # Patterns d'intérêt générique — déclenchent le bot même sans mot-clé métier
 # ex: "Bonjour ! Puis-je en savoir plus à ce sujet ?!"
+# ex: "Je viens de voir votre pub sur Facebook"
 INTEREST_PATTERNS = [
     "en savoir plus", "savoir plus", "plus d'info", "plus d info",
     "more info", "tell me more", "learn more", "know more",
@@ -250,7 +282,6 @@ def _is_greeting_only(message: str) -> bool:
         return True
 
     # Salutation + pattern d'intérêt → NE PAS ignorer
-    # ex: "Bonjour ! Puis-je en savoir plus à ce sujet ?!"
     msg_lower = message.lower()
     if any(p in msg_lower for p in INTEREST_PATTERNS):
         return False
@@ -283,8 +314,6 @@ def is_relevant(message: str) -> bool:
         return True
 
     # ── Niveau 3 : patterns d'intérêt → OUI immédiat ─────────
-    # ex: "Bonjour ! Puis-je en savoir plus à ce sujet ?!"
-    # ex: "Je viens de voir votre pub sur Facebook"
     if any(p in msg_lower for p in INTEREST_PATTERNS):
         print(f"✅ Pattern d'intérêt détecté → pertinent", flush=True)
         return True
@@ -566,6 +595,10 @@ def handle_message(chat_id: str, message: str):
 # ═══════════════════════════════════════════════════════════════
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    # Mise à jour STATE pour le monitoring
+    STATE["last_webhook"] = time.strftime("%H:%M:%S")
+    STATE["messages"] += 1
+
     try:
         data = request.get_json(force=True, silent=True)
         if not data:
@@ -591,6 +624,7 @@ def webhook():
 
         print(f"📩 [{chat_id}] '{message[:70]}'", flush=True)
 
+        # ⚡ ACK immédiat — traitement async pour ne pas bloquer Green API
         threading.Thread(
             target=handle_message,
             args=(chat_id, message),
@@ -606,11 +640,24 @@ def webhook():
         return jsonify({"error": str(e)}), 500
 
 # ═══════════════════════════════════════════════════════════════
-# 🏓 /ping  🏥 /health  🧪 /test-whatsapp
+# 🏓 /ping  🏥 /health  💚 /healthz  🧪 /test-whatsapp
 # ═══════════════════════════════════════════════════════════════
+
+@app.route("/healthz")
+def healthz():
+    """Ultra-rapide — pour UptimeRobot / Render health check."""
+    return "ok", 200
+
+
 @app.route("/ping", methods=["GET"])
 def ping():
-    return jsonify({"pong": True, "ts": time.time()}), 200
+    """Debug complet — uptime, messages, dernier webhook."""
+    return jsonify({
+        "status":       "alive" if STATE["alive"] else "stopping",
+        "uptime":       int(time.time() - STATE["started_at"]),
+        "messages":     STATE["messages"],
+        "last_webhook": STATE["last_webhook"],
+    }), 200
 
 
 @app.route("/health", methods=["GET"])
@@ -622,7 +669,9 @@ def health():
         steps[k] = steps.get(k, 0) + 1
     return jsonify({
         "status":             "ok",
-        "service":            "Chana Corporate WhatsApp Bot v11",
+        "service":            "Chana Corporate WhatsApp Bot v11.1",
+        "alive":              STATE["alive"],
+        "uptime_s":           int(time.time() - STATE["started_at"]),
         "started_at":         stats["started_at"],
         "jobs_processed":     stats["jobs_processed"],
         "jobs_failed":        stats["jobs_failed"],
@@ -631,6 +680,7 @@ def health():
         "processed_messages": len(processed_messages),
         "steps_breakdown":    steps,
         "operator_target":    OPERATOR_CHAT_ID or "⚠️ NON CONFIGURÉ",
+        "last_webhook":       STATE["last_webhook"],
     })
 
 
@@ -639,7 +689,7 @@ def test_whatsapp():
     ts = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     ok = send_whatsapp(
         OPERATOR_CHAT_ID,
-        f"🧪 *TEST BOT CHANA CORPORATE v11*\n\n✅ Bot opérationnel.\n⏱️ {ts}"
+        f"🧪 *TEST BOT CHANA CORPORATE v11.1*\n\n✅ Bot opérationnel.\n⏱️ {ts}"
     )
     return jsonify({"success": ok, "target": OPERATOR_CHAT_ID})
 
