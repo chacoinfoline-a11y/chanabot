@@ -160,28 +160,45 @@ def alert_human_request(chat_id: str, msg: str):
 # LOGIQUE :
 #   1. Mots-clés positifs → OUI immédiat (zéro appel Groq)
 #   2. Mots-clés négatifs → NON immédiat (zéro appel Groq)
-#   3. Zone grise → classification Groq légère
-#
-# Une salutation seule ("bonjour", "bonsoir") sans contexte
-# commercial = IGNORÉE.
-# Si la salutation vient après une pub Facebook ou contient
-# un mot déclencheur commercial = acceptée.
+#   3. Patterns d'intérêt → OUI immédiat (questions génériques, refs pub)
+#   4. Salutation seule → ignorée
+#   5. Zone grise → classification Groq légère
 # ═══════════════════════════════════════════════════════════════
 
 # Déclencheurs positifs certains → répondre sans appel Groq
 POSITIVE_KEYWORDS = [
+    # ── Entreprise & destination ──
     "chine", "chana", "zhejiang", "yiwu", "mission commerciale",
     "voyage", "fournisseur", "usine", "sourcing", "importation",
     "importateur", "exportation", "produit", "commande",
     "inscription", "s'inscrire", "inscrire", "forfait", "tarif",
     "prix", "acompte", "paiement", "visa", "billet", "hôtel",
-    "african wind", "pub", "publicité", "facebook", "annonce",
+    "african wind",
+    # ── Pub / réseaux sociaux ──
+    "pub", "publicité", "facebook", "annonce", "instagram",
     "votre annonce", "votre pub", "j'ai vu", "j'ai lu",
-    "intéressé", "interesse", "renseignement", "information",
-    "comment ça marche", "comment ca marche", "c'est quoi",
-    "c'est combien", "brochure", "fiche", "formulaire",
+    "votre post", "votre publication", "votre page",
+    "je viens de voir", "je viens de lire", "je suis tombé",
+    "je suis tombée", "vu sur", "lu sur", "seen on",
+    "your ad", "your post", "i saw", "i seen", "i just saw",
+    # ── Intérêt commercial ──
+    "intéressé", "interesse", "interested", "renseignement",
+    "information", "plus d'info", "plus d info", "more info",
+    "en savoir plus", "savoir plus", "en savoir davantage",
+    "tell me more", "learn more", "know more",
+    "comment ça marche", "comment ca marche", "how does it work",
+    "c'est quoi", "c'est combien", "what is this", "what is it",
+    "how much", "combien ça coûte", "combien ca coute",
+    "brochure", "fiche", "formulaire",
+    # ── Secteurs ──
     "btp", "automobile", "textile", "électroménager",
     "agriculture", "mobilier", "médical", "énergie",
+    # ── Questions génériques d'intérêt ──
+    "à ce sujet", "a ce sujet", "about this", "about that",
+    "ce programme", "ce voyage", "cette mission", "cette offre",
+    "plus d'informations", "plus d informations",
+    "pouvez-vous", "pouvez vous", "can you tell",
+    "puis-je", "puis je", "may i", "could you",
 ]
 
 # Déclencheurs négatifs certains → ignorer sans appel Groq
@@ -202,16 +219,55 @@ GREETINGS_ONLY = [
     "bonne journee", "bonne nuit", "bjr", "bsr",
 ]
 
+# Patterns d'intérêt générique — déclenchent le bot même sans mot-clé métier
+# ex: "Bonjour ! Puis-je en savoir plus à ce sujet ?!"
+INTEREST_PATTERNS = [
+    "en savoir plus", "savoir plus", "plus d'info", "plus d info",
+    "more info", "tell me more", "learn more", "know more",
+    "à ce sujet", "a ce sujet", "about this", "about that",
+    "puis-je", "puis je", "may i", "pouvez-vous", "pouvez vous",
+    "je viens de voir", "je viens de lire", "i just saw", "i saw your",
+    "vu sur", "lu sur", "votre pub", "votre annonce", "your ad",
+    "ce sujet", "cette offre", "ce programme",
+    "interested", "intéressé", "interesse",
+    "en savoir davantage", "davantage d'info",
+    "could you tell", "can you tell", "can i know",
+    "j'aimerais savoir", "j'aimerais en savoir",
+    "je souhaite savoir", "je voudrais savoir",
+    "i would like to know", "i'd like to know",
+]
+
 
 def _is_greeting_only(message: str) -> bool:
-    """Retourne True si le message est UNIQUEMENT une salutation sans contexte."""
+    """
+    Retourne True UNIQUEMENT si le message est une salutation PURE
+    sans aucune marque d'intérêt commercial.
+    """
     clean = message.lower().strip().rstrip("!.,?")
-    return clean in GREETINGS_ONLY
+
+    # Salutation pure exacte → ignorer
+    if clean in GREETINGS_ONLY:
+        return True
+
+    # Salutation + pattern d'intérêt → NE PAS ignorer
+    # ex: "Bonjour ! Puis-je en savoir plus à ce sujet ?!"
+    msg_lower = message.lower()
+    if any(p in msg_lower for p in INTEREST_PATTERNS):
+        return False
+
+    # Salutation + quelque chose après → laisser passer en zone grise
+    for greet in GREETINGS_ONLY:
+        if clean.startswith(greet):
+            remainder = clean[len(greet):].strip().lstrip(",;-– ")
+            if len(remainder) > 3:
+                return False  # Groq décidera
+
+    return False
 
 
 def is_relevant(message: str) -> bool:
     """
-    Filtre de pertinence à 3 niveaux.
+    Filtre de pertinence à 5 niveaux.
     Retourne True si le bot doit répondre.
     """
     msg_lower = message.lower()
@@ -226,16 +282,19 @@ def is_relevant(message: str) -> bool:
         print(f"✅ Mot-clé positif détecté → pertinent", flush=True)
         return True
 
-    # ── Niveau 3 : salutation seule → ignorée ─────────────────
-    # Une salutation sans aucun contexte commercial = probablement
-    # un mauvais numéro ou un message personnel. On n'engage pas.
+    # ── Niveau 3 : patterns d'intérêt → OUI immédiat ─────────
+    # ex: "Bonjour ! Puis-je en savoir plus à ce sujet ?!"
+    # ex: "Je viens de voir votre pub sur Facebook"
+    if any(p in msg_lower for p in INTEREST_PATTERNS):
+        print(f"✅ Pattern d'intérêt détecté → pertinent", flush=True)
+        return True
+
+    # ── Niveau 4 : salutation seule → ignorée ─────────────────
     if _is_greeting_only(message):
         print(f"🔕 Salutation seule → ignorée (pas de contexte commercial)", flush=True)
         return False
 
-    # ── Niveau 4 : zone grise → classification Groq légère ───
-    # Seulement si le message n'est ni positif, ni négatif, ni
-    # une salutation seule (ex: phrase ambiguë de 10+ mots)
+    # ── Niveau 5 : zone grise → classification Groq légère ───
     try:
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -249,17 +308,19 @@ def is_relevant(message: str) -> bool:
                             "d'une entreprise ivoirienne organisant des voyages d'affaires "
                             "en Chine (Chana Corporate).\n\n"
                             "Réponds UNIQUEMENT OUI ou NON.\n\n"
-                            "OUI uniquement si le message exprime clairement :\n"
+                            "OUI si le message exprime :\n"
                             "- un intérêt pour une mission commerciale, voyage d'affaires, "
                             "sourcing, importation/exportation, fournisseurs chinois\n"
                             "- une question sur les services ou tarifs de l'entreprise\n"
                             "- une demande suite à une publicité Facebook/Instagram\n"
-                            "- une intention d'achat ou d'inscription\n\n"
+                            "- une intention d'achat ou d'inscription\n"
+                            "- une curiosité générale sur une offre ou annonce vue en ligne\n"
+                            "- toute formulation du type 'puis-je en savoir plus', "
+                            "'je voudrais des informations', 'c'est quoi exactement'\n\n"
                             "NON dans TOUS les autres cas, notamment :\n"
                             "- salutations sans contexte commercial\n"
                             "- conversations personnelles\n"
-                            "- sujets sans rapport avec le commerce international\n"
-                            "- messages ambigus sans intention commerciale claire\n\n"
+                            "- sujets sans rapport avec le commerce international\n\n"
                             "Sois STRICT. En cas de doute → NON."
                         )
                     },
@@ -275,7 +336,6 @@ def is_relevant(message: str) -> bool:
             timeout=(3, 6)
         )
         if r.status_code != 200:
-            # Fail-open uniquement si l'API est down
             print(f"⚠️ Filtre Groq KO ({r.status_code}) — fail-open", flush=True)
             return True
 
@@ -289,7 +349,6 @@ def is_relevant(message: str) -> bool:
         return result
 
     except Exception as e:
-        # Fail-open si réseau down, pas si message suspect
         print(f"⚠️ Filtre exception ({e}) — fail-open", flush=True)
         return True
 
@@ -317,7 +376,7 @@ Tu représentes l'entreprise 24h/24 et 7j/7 sur WhatsApp.
 
 CONTEXTE IMPORTANT :
 Certains prospects arrivent via une campagne publicitaire Facebook/Instagram.
-Ils peuvent écrire des choses comme "j'ai vu votre pub", "votre annonce Facebook", "c'est quoi exactement ?".
+Ils peuvent écrire des choses comme "j'ai vu votre pub", "votre annonce Facebook", "c'est quoi exactement ?", "puis-je en savoir plus à ce sujet ?".
 Traite-les exactement comme n'importe quel prospect — accueil chaleureux, présentation progressive.
 
 OBJECTIF : Accueillir chaleureusement, comprendre le besoin, présenter les services progressivement, répondre à toutes les questions, amener vers l'inscription ou la prise de contact.
