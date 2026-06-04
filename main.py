@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║        CHANA CORPORATE WHATSAPP BOT  v11.1                  ║
+║        CHANA CORPORATE WHATSAPP BOT  v12.0                  ║
 ║        Render stable — threading par requête                ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Start Command Render :                                     ║
@@ -31,7 +31,7 @@ BOT_OWN_NUMBER   = os.getenv("BOT_OWN_NUMBER",   "")
 
 GREEN_API_BASE = f"https://api.green-api.com/waInstance{ID_INSTANCE}"
 
-MEMORY_TTL     = 7_200   # 2h
+MEMORY_TTL     = 7_200
 HISTORY_MAX    = 20
 ESCALADE_SEUIL = 5
 
@@ -43,7 +43,7 @@ LINK_PDF   = "https://drive.google.com/file/d/1QtZaRDUHgVsRIal05i7RuhvVVz1gnZEz/
 LINK_BROCH = "https://drive.google.com/file/d/1YEEsJEDARjkb2QBk1dw3SVDtVNm9O7p0/view?usp=sharing"
 
 # ═══════════════════════════════════════════════════════════════
-# 📊 STATE GLOBAL (uptime, santé, stats)
+# 📊 STATE GLOBAL
 # ═══════════════════════════════════════════════════════════════
 STATE = {
     "started_at":   time.time(),
@@ -52,17 +52,14 @@ STATE = {
     "alive":        True,
 }
 
-# ═══════════════════════════════════════════════════════════════
-# 🚨 SIGNAL SIGTERM — détecte redéploiement / maintenance Render
-# ═══════════════════════════════════════════════════════════════
 def _sigterm(sig, frame):
-    print("🚨 SIGTERM reçu (redéploiement ou maintenance Render)", flush=True)
+    print("🚨 SIGTERM reçu", flush=True)
     STATE["alive"] = False
 
 signal.signal(signal.SIGTERM, _sigterm)
 
 # ═══════════════════════════════════════════════════════════════
-# 💓 HEARTBEAT — log toutes les 15s pour prouver que le process vit
+# 💓 HEARTBEAT
 # ═══════════════════════════════════════════════════════════════
 def _heartbeat():
     while True:
@@ -108,7 +105,7 @@ def check_env():
 check_env()
 
 # ═══════════════════════════════════════════════════════════════
-# 🧹 NETTOYAGE MÉMOIRE — TTL 2h, cycle 30min
+# 🧹 NETTOYAGE MÉMOIRE
 # ═══════════════════════════════════════════════════════════════
 def _memory_cleanup():
     while True:
@@ -189,32 +186,83 @@ def alert_human_request(chat_id: str, msg: str):
     )
 
 # ═══════════════════════════════════════════════════════════════
-# 🔍 FILTRE DE PERTINENCE
+# 📨 PARSE_MESSAGE — multi-format Green API
 #
-# LOGIQUE :
-#   1. Mots-clés négatifs  → NON immédiat (zéro appel Groq)
-#   2. Mots-clés positifs  → OUI immédiat (zéro appel Groq)
-#   3. Patterns d'intérêt  → OUI immédiat (questions génériques, refs pub)
-#   4. Salutation seule    → ignorée
-#   5. Zone grise          → classification Groq légère
+# Green API peut envoyer le texte dans plusieurs champs selon
+# le type de message. Cette fonction les essaie tous dans l'ordre
+# et retourne (texte, source) ou ("", "none") si vide.
+#
+# Formats supportés :
+#   textMessageData.textMessage          → message texte simple
+#   extendedTextMessageData.text         → message avec preview/lien
+#   quotedMessage.textMessageData.text   → message cité
+#   imageMessage.caption                 → légende photo
+#   videoMessage.caption                 → légende vidéo
+#   documentMessage.caption              → légende document
+#   locationMessage.nameLocation         → lieu partagé
+# ═══════════════════════════════════════════════════════════════
+def parse_message(msg_data: dict) -> tuple[str, str]:
+    """
+    Extrait le texte d'un messageData Green API.
+    Retourne (texte_nettoyé, source_field).
+    Retourne ("", "none") si aucun texte trouvé.
+    """
+    if not msg_data:
+        return "", "none"
+
+    # ── 1. Message texte simple ───────────────────────────────
+    text = msg_data.get("textMessageData", {}).get("textMessage", "")
+    if text and text.strip():
+        return text.strip(), "textMessageData"
+
+    # ── 2. Message texte étendu (liens, previews) ─────────────
+    text = msg_data.get("extendedTextMessageData", {}).get("text", "")
+    if text and text.strip():
+        return text.strip(), "extendedTextMessageData"
+
+    # ── 3. Message cité (reply) ───────────────────────────────
+    # Le vrai texte du client est dans le champ "caption" ou
+    # dans extendedTextMessageData même pour les replies
+    quoted = msg_data.get("quotedMessage", {})
+    if quoted:
+        text = quoted.get("textMessageData", {}).get("textMessage", "")
+        if text and text.strip():
+            return text.strip(), "quotedMessage"
+
+    # ── 4. Légende image / vidéo / document ──────────────────
+    for field in ("imageMessage", "videoMessage", "documentMessage"):
+        text = msg_data.get(field, {}).get("caption", "")
+        if text and text.strip():
+            return text.strip(), field
+
+    # ── 5. Localisation partagée ─────────────────────────────
+    text = msg_data.get("locationMessage", {}).get("nameLocation", "")
+    if text and text.strip():
+        return text.strip(), "locationMessage"
+
+    # ── 6. Aucun texte trouvé — on log le contenu brut ───────
+    keys = list(msg_data.keys())
+    print(f"⚠️  parse_message: aucun texte trouvé | clés disponibles: {keys}", flush=True)
+    return "", "none"
+
+
+# ═══════════════════════════════════════════════════════════════
+# 🔍 FILTRE DE PERTINENCE — 5 niveaux
 # ═══════════════════════════════════════════════════════════════
 
 POSITIVE_KEYWORDS = [
-    # ── Entreprise & destination ──
     "chine", "chana", "zhejiang", "yiwu", "mission commerciale",
     "voyage", "fournisseur", "usine", "sourcing", "importation",
     "importateur", "exportation", "produit", "commande",
     "inscription", "s'inscrire", "inscrire", "forfait", "tarif",
     "prix", "acompte", "paiement", "visa", "billet", "hôtel",
     "african wind",
-    # ── Pub / réseaux sociaux ──
     "pub", "publicité", "facebook", "annonce", "instagram",
     "votre annonce", "votre pub", "j'ai vu", "j'ai lu",
     "votre post", "votre publication", "votre page",
     "je viens de voir", "je viens de lire", "je suis tombé",
     "je suis tombée", "vu sur", "lu sur", "seen on",
     "your ad", "your post", "i saw", "i seen", "i just saw",
-    # ── Intérêt commercial ──
     "intéressé", "interesse", "interested", "renseignement",
     "information", "plus d'info", "plus d info", "more info",
     "en savoir plus", "savoir plus", "en savoir davantage",
@@ -223,15 +271,15 @@ POSITIVE_KEYWORDS = [
     "c'est quoi", "c'est combien", "what is this", "what is it",
     "how much", "combien ça coûte", "combien ca coute",
     "brochure", "fiche", "formulaire",
-    # ── Secteurs ──
     "btp", "automobile", "textile", "électroménager",
     "agriculture", "mobilier", "médical", "énergie",
-    # ── Questions génériques d'intérêt ──
     "à ce sujet", "a ce sujet", "about this", "about that",
     "ce programme", "ce voyage", "cette mission", "cette offre",
     "plus d'informations", "plus d informations",
     "pouvez-vous", "pouvez vous", "can you tell",
     "puis-je", "puis je", "may i", "could you",
+    "j'aimerais savoir", "je souhaite savoir", "je voudrais savoir",
+    "i would like to know", "i'd like to know",
 ]
 
 NEGATIVE_KEYWORDS = [
@@ -241,18 +289,16 @@ NEGATIVE_KEYWORDS = [
     "religion", "dieu", "prière", "priere", "église",
     "blague", "joke", "lol", "haha", "mdr",
     "amour", "chéri", "cherie", "copine", "copain",
-    "whatsapp", "sms", "appel manqué", "appel manque",
+    "appel manqué", "appel manque",
 ]
 
-GREETINGS_ONLY = [
+GREETINGS_ONLY = {
     "bonjour", "bonsoir", "salut", "allô", "allo",
     "hello", "hi", "hey", "coucou", "bonne journée",
-    "bonne journee", "bonne nuit", "bjr", "bsr",
-]
+    "bonne journee", "bonne nuit", "bjr", "bsr", "slt",
+    "bsr", "bjrs", "bnjr",
+}
 
-# Patterns d'intérêt générique — déclenchent le bot même sans mot-clé métier
-# ex: "Bonjour ! Puis-je en savoir plus à ce sujet ?!"
-# ex: "Je viens de voir votre pub sur Facebook"
 INTEREST_PATTERNS = [
     "en savoir plus", "savoir plus", "plus d'info", "plus d info",
     "more info", "tell me more", "learn more", "know more",
@@ -264,66 +310,46 @@ INTEREST_PATTERNS = [
     "interested", "intéressé", "interesse",
     "en savoir davantage", "davantage d'info",
     "could you tell", "can you tell", "can i know",
-    "j'aimerais savoir", "j'aimerais en savoir",
-    "je souhaite savoir", "je voudrais savoir",
+    "j'aimerais savoir", "je souhaite savoir", "je voudrais savoir",
     "i would like to know", "i'd like to know",
 ]
 
 
 def _is_greeting_only(message: str) -> bool:
-    """
-    Retourne True UNIQUEMENT si le message est une salutation PURE
-    sans aucune marque d'intérêt commercial.
-    """
     clean = message.lower().strip().rstrip("!.,?")
-
-    # Salutation pure exacte → ignorer
     if clean in GREETINGS_ONLY:
         return True
-
-    # Salutation + pattern d'intérêt → NE PAS ignorer
     msg_lower = message.lower()
     if any(p in msg_lower for p in INTEREST_PATTERNS):
         return False
-
-    # Salutation + quelque chose après → laisser passer en zone grise
     for greet in GREETINGS_ONLY:
         if clean.startswith(greet):
             remainder = clean[len(greet):].strip().lstrip(",;-– ")
             if len(remainder) > 3:
-                return False  # Groq décidera
-
+                return False
     return False
 
 
 def is_relevant(message: str) -> bool:
-    """
-    Filtre de pertinence à 5 niveaux.
-    Retourne True si le bot doit répondre.
-    """
     msg_lower = message.lower()
 
-    # ── Niveau 1 : mots-clés négatifs → NON immédiat ─────────
     if any(kw in msg_lower for kw in NEGATIVE_KEYWORDS):
-        print(f"🚫 Mot-clé négatif détecté → ignoré", flush=True)
+        print(f"🚫 [FILTRE] Mot-clé négatif → IGNORE", flush=True)
         return False
 
-    # ── Niveau 2 : mots-clés positifs → OUI immédiat ─────────
     if any(kw in msg_lower for kw in POSITIVE_KEYWORDS):
-        print(f"✅ Mot-clé positif détecté → pertinent", flush=True)
+        print(f"✅ [FILTRE] Mot-clé positif → ACCEPT", flush=True)
         return True
 
-    # ── Niveau 3 : patterns d'intérêt → OUI immédiat ─────────
     if any(p in msg_lower for p in INTEREST_PATTERNS):
-        print(f"✅ Pattern d'intérêt détecté → pertinent", flush=True)
+        print(f"✅ [FILTRE] Pattern intérêt → ACCEPT", flush=True)
         return True
 
-    # ── Niveau 4 : salutation seule → ignorée ─────────────────
     if _is_greeting_only(message):
-        print(f"🔕 Salutation seule → ignorée (pas de contexte commercial)", flush=True)
+        print(f"🔕 [FILTRE] Salutation seule → IGNORE", flush=True)
         return False
 
-    # ── Niveau 5 : zone grise → classification Groq légère ───
+    # Zone grise → Groq
     try:
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -343,13 +369,8 @@ def is_relevant(message: str) -> bool:
                             "- une question sur les services ou tarifs de l'entreprise\n"
                             "- une demande suite à une publicité Facebook/Instagram\n"
                             "- une intention d'achat ou d'inscription\n"
-                            "- une curiosité générale sur une offre ou annonce vue en ligne\n"
-                            "- toute formulation du type 'puis-je en savoir plus', "
-                            "'je voudrais des informations', 'c'est quoi exactement'\n\n"
-                            "NON dans TOUS les autres cas, notamment :\n"
-                            "- salutations sans contexte commercial\n"
-                            "- conversations personnelles\n"
-                            "- sujets sans rapport avec le commerce international\n\n"
+                            "- une curiosité sur une offre vue en ligne\n\n"
+                            "NON dans TOUS les autres cas.\n"
                             "Sois STRICT. En cas de doute → NON."
                         )
                     },
@@ -365,20 +386,14 @@ def is_relevant(message: str) -> bool:
             timeout=(3, 6)
         )
         if r.status_code != 200:
-            print(f"⚠️ Filtre Groq KO ({r.status_code}) — fail-open", flush=True)
+            print(f"⚠️ [FILTRE] Groq KO ({r.status_code}) → fail-open", flush=True)
             return True
-
         answer = r.json()["choices"][0]["message"]["content"].strip().upper()
         result = answer.startswith("OUI")
-        print(
-            f"🔍 Classification Groq : {'✅ OUI' if result else '❌ NON'} "
-            f"| '{message[:50]}'",
-            flush=True
-        )
+        print(f"🔍 [FILTRE] Groq → {'ACCEPT' if result else 'IGNORE'} | '{message[:50]}'", flush=True)
         return result
-
     except Exception as e:
-        print(f"⚠️ Filtre exception ({e}) — fail-open", flush=True)
+        print(f"⚠️ [FILTRE] Exception ({e}) → fail-open", flush=True)
         return True
 
 
@@ -397,6 +412,7 @@ HUMAN_KEYWORDS = [
 def wants_human(message: str) -> bool:
     return any(kw in message.lower() for kw in HUMAN_KEYWORDS)
 
+
 # ═══════════════════════════════════════════════════════════════
 # 🤖 RÉPONSE IA
 # ═══════════════════════════════════════════════════════════════
@@ -405,8 +421,8 @@ Tu représentes l'entreprise 24h/24 et 7j/7 sur WhatsApp.
 
 CONTEXTE IMPORTANT :
 Certains prospects arrivent via une campagne publicitaire Facebook/Instagram.
-Ils peuvent écrire des choses comme "j'ai vu votre pub", "votre annonce Facebook", "c'est quoi exactement ?", "puis-je en savoir plus à ce sujet ?".
-Traite-les exactement comme n'importe quel prospect — accueil chaleureux, présentation progressive.
+Ils peuvent écrire : "j'ai vu votre pub", "votre annonce Facebook", "c'est quoi exactement ?", "puis-je en savoir plus ?".
+Traite-les comme n'importe quel prospect — accueil chaleureux, présentation progressive.
 
 OBJECTIF : Accueillir chaleureusement, comprendre le besoin, présenter les services progressivement, répondre à toutes les questions, amener vers l'inscription ou la prise de contact.
 
@@ -489,6 +505,7 @@ def ask_groq(chat_id: str, message: str) -> str:
         print(f"❌ GROQ exception : {e}", flush=True)
         return "Le service est momentanément indisponible. Veuillez réessayer."
 
+
 # ═══════════════════════════════════════════════════════════════
 # 🛡️ ANTI-DOUBLON
 # ═══════════════════════════════════════════════════════════════
@@ -499,6 +516,7 @@ def is_duplicate(msg_id: str) -> bool:
         processed_messages.add(msg_id)
         return False
 
+
 # ═══════════════════════════════════════════════════════════════
 # ⚙️  TRAITEMENT D'UN MESSAGE
 # ═══════════════════════════════════════════════════════════════
@@ -507,13 +525,12 @@ def handle_message(chat_id: str, message: str):
         with _state_lock:
             state = user_state.get(chat_id)
 
-        # ── NOUVEAU NUMÉRO — filtre strict avant tout ─────────
         if state is None:
             if not is_relevant(message):
                 stats["ignored_offtopic"] += 1
-                print(f"🚫 Ignoré [{chat_id}] : '{message[:60]}'", flush=True)
+                print(f"🚫 [IGNORE] [{chat_id}] : '{message[:60]}'", flush=True)
                 return
-            print(f"✅ Nouveau prospect qualifié : {chat_id}", flush=True)
+            print(f"✅ [NEW PROSPECT] {chat_id}", flush=True)
             now = time.time()
             with _state_lock:
                 user_state[chat_id] = {
@@ -525,20 +542,15 @@ def handle_message(chat_id: str, message: str):
                 }
                 state = user_state[chat_id]
 
-        # Mise à jour last_seen
         with _state_lock:
             state["last_seen"] = time.time()
             step = state["step"]
 
-        # ── Bot silencieux (humain en charge) ─────────────────
         if step == "human":
-            print(f"🔕 Silencieux {chat_id}", flush=True)
+            print(f"🔕 [SILENT] {chat_id}", flush=True)
             return
 
-        # ── Mode IA ───────────────────────────────────────────
         if step == "ai":
-
-            # Demande humain explicite
             if wants_human(message):
                 with _state_lock:
                     state["step"]      = "human"
@@ -556,16 +568,14 @@ def handle_message(chat_id: str, message: str):
                 stats["jobs_processed"] += 1
                 return
 
-            # Réponse IA
             reply = ask_groq(chat_id, message)
             with _state_lock:
                 state["exchanges"] += 1
                 exchanges = state["exchanges"]
 
             send_whatsapp(chat_id, reply)
-            print(f"💬 Échange #{exchanges} | {chat_id}", flush=True)
+            print(f"💬 [EXCHANGE #{exchanges}] {chat_id}", flush=True)
 
-            # Escalade après N échanges
             if exchanges >= ESCALADE_SEUIL and not state.get("escalated"):
                 with _state_lock:
                     state["escalated"] = True
@@ -587,78 +597,138 @@ def handle_message(chat_id: str, message: str):
 
     except Exception as e:
         stats["jobs_failed"] += 1
-        print(f"❌ handle_message [{chat_id}] : {e}", flush=True)
+        print(f"❌ [handle_message] [{chat_id}] : {e}", flush=True)
         traceback.print_exc()
 
+
 # ═══════════════════════════════════════════════════════════════
-# 📩 WEBHOOK
+# 📩 WEBHOOK — robuste multi-format Green API
 # ═══════════════════════════════════════════════════════════════
+
+# Types de webhooks Green API que l'on DOIT traiter
+INCOMING_TYPES = {"incomingMessageReceived"}
+
+# Types connus à ignorer silencieusement (pas de log d'erreur)
+IGNORED_TYPES = {
+    "outgoingMessageReceived",    # message envoyé par le bot
+    "outgoingAPIMessageReceived", # message API sortant
+    "messageDelivered",           # confirmation de livraison
+    "messageRead",                # confirmation de lecture
+    "deviceInfo",                 # info appareil
+    "stateInstanceChanged",       # changement d'état de l'instance
+    "statusInstanceChanged",      # changement de statut
+    "incomingCall",               # appel entrant
+    "outgoingCall",               # appel sortant
+    "quotaExceeded",              # quota dépassé
+}
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # Mise à jour STATE pour le monitoring
     STATE["last_webhook"] = time.strftime("%H:%M:%S")
     STATE["messages"] += 1
 
     try:
+        # ── Parse du body ─────────────────────────────────────
+        raw = request.get_data(as_text=True)
         data = request.get_json(force=True, silent=True)
+
         if not data:
+            print(f"❌ [WEBHOOK] Body invalide | raw='{raw[:200]}'", flush=True)
             return jsonify({"error": "invalid_json"}), 400
 
-        if data.get("typeWebhook") != "incomingMessageReceived":
-            return jsonify({"ignored": True, "reason": "not_a_message"})
+        webhook_type = data.get("typeWebhook", "unknown")
 
+        # ── Log RAW systématique ──────────────────────────────
+        print(f"\n{'─'*55}", flush=True)
+        print(f"📥 [WEBHOOK] type={webhook_type}", flush=True)
+
+        # ── Ignorer les events système connus ─────────────────
+        if webhook_type in IGNORED_TYPES:
+            print(f"   → SKIP (event système)", flush=True)
+            print(f"{'─'*55}\n", flush=True)
+            return jsonify({"ignored": True, "reason": webhook_type}), 200
+
+        # ── Traiter uniquement les messages entrants ──────────
+        if webhook_type not in INCOMING_TYPES:
+            print(f"   → SKIP (type non géré : {webhook_type})", flush=True)
+            print(f"{'─'*55}\n", flush=True)
+            return jsonify({"ignored": True, "reason": f"unhandled_type:{webhook_type}"}), 200
+
+        # ── Extraction des champs ─────────────────────────────
         sender   = data.get("senderData", {})
         msg_data = data.get("messageData", {})
         chat_id  = sender.get("chatId", "")
-        message  = msg_data.get("textMessageData", {}).get("textMessage", "").strip()
         msg_id   = data.get("idMessage", "")
 
+        print(f"   chat_id  = {chat_id}", flush=True)
+        print(f"   msg_id   = {msg_id}", flush=True)
+        print(f"   msg_data keys = {list(msg_data.keys())}", flush=True)
+
+        # ── Filtres système ───────────────────────────────────
         if chat_id.endswith("@g.us"):
-            return jsonify({"ignored": True, "reason": "group"})
+            print(f"   → SKIP (groupe externe)", flush=True)
+            print(f"{'─'*55}\n", flush=True)
+            return jsonify({"ignored": True, "reason": "group"}), 200
+
         if BOT_OWN_NUMBER and chat_id == BOT_OWN_NUMBER:
-            return jsonify({"ignored": True, "reason": "self"})
-        if not chat_id or not message:
-            return jsonify({"ok": True, "reason": "empty"}), 200
+            print(f"   → SKIP (self)", flush=True)
+            print(f"{'─'*55}\n", flush=True)
+            return jsonify({"ignored": True, "reason": "self"}), 200
+
+        # ── Anti-doublon ──────────────────────────────────────
         if msg_id and is_duplicate(msg_id):
-            return jsonify({"ignored": True, "reason": "duplicate"})
+            print(f"   → SKIP (doublon)", flush=True)
+            print(f"{'─'*55}\n", flush=True)
+            return jsonify({"ignored": True, "reason": "duplicate"}), 200
 
-        print(f"📩 [{chat_id}] '{message[:70]}'", flush=True)
+        # ── Parse multi-format ────────────────────────────────
+        message, source = parse_message(msg_data)
 
-        # ⚡ ACK immédiat — traitement async pour ne pas bloquer Green API
+        print(f"   source   = {source}", flush=True)
+        print(f"   message  = '{message[:100]}'", flush=True)
+
+        # ── Pas de texte exploitable ──────────────────────────
+        if not message:
+            print(f"   → SKIP (pas de texte | source={source})", flush=True)
+            print(f"{'─'*55}\n", flush=True)
+            # On répond quand même 200 pour ne pas faire retry Green API
+            return jsonify({"ignored": True, "reason": f"no_text:{source}"}), 200
+
+        print(f"   → ACCEPT → thread lancé", flush=True)
+        print(f"{'─'*55}\n", flush=True)
+
+        # ── Traitement async ──────────────────────────────────
         threading.Thread(
             target=handle_message,
             args=(chat_id, message),
             daemon=True,
-            name=f"msg-{msg_id[:8]}"
+            name=f"msg-{msg_id[:8] if msg_id else 'noid'}"
         ).start()
 
-        return jsonify({"ok": True, "processing": True}), 202
+        return jsonify({"ok": True, "processing": True, "source": source}), 202
 
     except Exception as e:
-        print(f"❌ WEBHOOK : {e}", flush=True)
+        print(f"❌ [WEBHOOK EXCEPTION] {e}", flush=True)
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-# ═══════════════════════════════════════════════════════════════
-# 🏓 /ping  🏥 /health  💚 /healthz  🧪 /test-whatsapp
-# ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# 🏓 /ping  /healthz  /health  /test-whatsapp
+# ═══════════════════════════════════════════════════════════════
 @app.route("/healthz")
 def healthz():
-    """Ultra-rapide — pour UptimeRobot / Render health check."""
     return "ok", 200
-
 
 @app.route("/ping", methods=["GET"])
 def ping():
-    """Debug complet — uptime, messages, dernier webhook."""
     return jsonify({
         "status":       "alive" if STATE["alive"] else "stopping",
         "uptime":       int(time.time() - STATE["started_at"]),
         "messages":     STATE["messages"],
         "last_webhook": STATE["last_webhook"],
     }), 200
-
 
 @app.route("/health", methods=["GET"])
 @app.route("/", methods=["GET"])
@@ -669,7 +739,7 @@ def health():
         steps[k] = steps.get(k, 0) + 1
     return jsonify({
         "status":             "ok",
-        "service":            "Chana Corporate WhatsApp Bot v11.1",
+        "service":            "Chana Corporate WhatsApp Bot v12",
         "alive":              STATE["alive"],
         "uptime_s":           int(time.time() - STATE["started_at"]),
         "started_at":         stats["started_at"],
@@ -683,13 +753,12 @@ def health():
         "last_webhook":       STATE["last_webhook"],
     })
 
-
 @app.route("/test-whatsapp", methods=["GET"])
 def test_whatsapp():
     ts = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     ok = send_whatsapp(
         OPERATOR_CHAT_ID,
-        f"🧪 *TEST BOT CHANA CORPORATE v11.1*\n\n✅ Bot opérationnel.\n⏱️ {ts}"
+        f"🧪 *TEST BOT CHANA CORPORATE v12*\n\n✅ Bot opérationnel.\n⏱️ {ts}"
     )
     return jsonify({"success": ok, "target": OPERATOR_CHAT_ID})
 
